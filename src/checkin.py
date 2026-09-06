@@ -1,9 +1,8 @@
-"""VPS8 (vps8.zz.cd) 签到主流程 - 混合策略（Cookie 优先 + 密码兜底）
+"""VPS8 (vps8.zz.cd) 签到主流程。
 
 环境变量：
-    VPS8_EMAIL         (必填) 登录邮箱
-    VPS8_PASSWORD      (必填) 登录密码
-    VPS8_COOKIES       (可选) JSON 格式的 Cookie 数组，用于跳过登录步骤
+    VPS8_EMAIL    (必填) 登录邮箱
+    VPS8_PASSWORD (必填) 登录密码
     TELEGRAM_BOT_TOKEN (可选)
     TELEGRAM_CHAT_ID   (可选)
     GITHUB_RUN_URL     (可选，由 workflow 注入)
@@ -16,7 +15,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -91,75 +89,6 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
-# ============================================================
-#  第一部分：Cookie 登录相关
-# ============================================================
-
-def _try_cookie_login(page) -> bool:
-    """尝试从环境变量 VPS8_COOKIES 加载 Cookie 并验证是否有效。"""
-    cookie_json = os.environ.get("VPS8_COOKIES", "").strip()
-    if not cookie_json:
-        return False
-
-    try:
-        cookies = json.loads(cookie_json)
-        # 兼容两种格式：字典 {"name":"value"} 或列表 [{"name":"x","value":"y"}]
-        if isinstance(cookies, dict):
-            cookies = [
-                {"name": k, "value": v, "domain": "vps8.zz.cd"}
-                for k, v in cookies.items()
-            ]
-        page.set.cookies(cookies)
-        print("[checkin] 已注入 Cookie，验证有效性...")
-        page.get(BASE_URL)
-        time.sleep(2)
-
-        if "/login" not in page.url:
-            print(f"[checkin] Cookie 有效，当前页面: {page.url}")
-            return True
-        else:
-            print("[checkin] Cookie 无效或已过期，仍停留在登录页")
-            return False
-    except json.JSONDecodeError as exc:
-        print(f"[checkin] VPS8_COOKIES 格式不是合法 JSON: {exc}")
-        return False
-    except Exception as exc:
-        print(f"[checkin] Cookie 处理异常: {exc}")
-        return False
-
-
-def _save_new_cookies_to_env(page) -> None:
-    """登录成功后提取 Cookie，打印到控制台，方便用户更新 GitHub Secrets。"""
-    try:
-        cookies = page.cookies()
-        if not cookies:
-            print("[checkin] 未能获取到 Cookie")
-            return
-
-        # 只保留 vps8.zz.cd 域名的 Cookie，避免存无关域名
-        filtered = [
-            c for c in cookies
-            if "vps8.zz.cd" in c.get("domain", "")
-        ]
-        if not filtered:
-            filtered = cookies  # 兜底：如果过滤后为空则全存
-
-        cookie_str = json.dumps(filtered, ensure_ascii=False)
-        print("\n" + "=" * 70)
-        print("[重要] 登录成功！已获取到新的有效 Cookie。")
-        print("建议将以下内容复制，并更新到 GitHub Secrets 的 VPS8_COOKIES 中（覆盖旧值），")
-        print("这样下次运行就能直接跳过登录和 Turnstile 盾，速度更快：")
-        print("-" * 70)
-        print(cookie_str)
-        print("=" * 70 + "\n")
-    except Exception as exc:
-        print(f"[checkin] 提取新 Cookie 失败: {exc}")
-
-
-# ============================================================
-#  第二部分：邮箱密码登录（原有逻辑，稍作微调）
-# ============================================================
-
 def _fill_email_and_password(page, email: str, password: str) -> None:
     """根据 vps8 登录页结构填入邮箱和密码。"""
     email_input = (
@@ -226,6 +155,7 @@ def _click_login_button(page) -> None:
         clicked = False
 
     if not clicked:
+        # 兜底：submit 按钮
         submit_btn = page.ele("tag:button@type=submit", timeout=2)
         if submit_btn:
             submit_btn.click()
@@ -248,11 +178,11 @@ def _wait_until_logged_in(page, timeout: int = 30) -> bool:
     return False
 
 
-def _login_with_email(page, email: str, password: str) -> None:
-    """使用邮箱密码登录（会处理 Turnstile）。"""
+def _login(page, email: str, password: str) -> None:
     print(f"[checkin] 访问登录页: {LOGIN_URL}")
     page.get(LOGIN_URL)
 
+    # 等密码框出现，确认表单渲染完毕
     pass_input = page.ele("tag:input@type=password", timeout=20)
     if not pass_input:
         browser.screenshot(page, "01-login-no-form")
@@ -262,11 +192,13 @@ def _login_with_email(page, email: str, password: str) -> None:
 
     _fill_email_and_password(page, email, password)
 
+    # 先处理 Cloudflare Turnstile 复选框（在点击登录之前）
     print("[checkin] 尝试处理 Cloudflare Turnstile")
     turnstile_ok = browser.solve_turnstile(page, timeout=60)
     if not turnstile_ok:
         print("[checkin] Turnstile 未确认通过，继续尝试登录")
     else:
+        # 即便 solve_turnstile 已返回 True，再多留一拍，保证服务端能收到 token
         time.sleep(1)
 
     browser.screenshot(page, "01a-after-turnstile")
@@ -279,10 +211,6 @@ def _login_with_email(page, email: str, password: str) -> None:
 
     browser.screenshot(page, "02-after-login")
 
-
-# ============================================================
-#  第三部分：签到核心流程（从进入签到页到确认成功）
-# ============================================================
 
 def _go_to_checkin_page(page) -> None:
     """点击顶部导航栏的「签到」链接，失败时直接 GET。"""
@@ -324,7 +252,10 @@ def _go_to_checkin_page(page) -> None:
 
 
 def _click_checkin_action(page) -> bool:
-    """在签到页面尝试点击「立即签到」按钮。返回是否点击到。"""
+    """在签到页面尝试点击「立即签到」按钮。返回是否点击到。
+
+    必须用 button / role=button，避免点到顶部导航的「签到」<a> 链接。
+    """
     js = r"""
     const isVisible = (el) => {
       const style = window.getComputedStyle(el);
@@ -336,6 +267,7 @@ def _click_checkin_action(page) -> bool:
         && !el.disabled;
     };
     const keywords = ['立即签到', '点击签到', '签到领取', '今日签到'];
+    // 只选按钮类元素，明确排除 <a>（顶部导航的「签到」是 <a>）
     const candidates = Array.from(document.querySelectorAll(
       'button, [role="button"], input[type="button"], input[type="submit"]'
     ));
@@ -367,18 +299,14 @@ def _confirm_checkin_success(page, timeout: int = 20) -> bool:
     return False
 
 
-def _execute_checkin_flow(page) -> str:
-    """执行签到页导航、状态检查、Turnstile 处理、点击签到、确认成功。
-
-    返回状态描述字符串。
-    """
+def do_checkin(page, email: str, password: str) -> str:
+    _login(page, email, password)
     _go_to_checkin_page(page)
 
-    # 等签到页内容渲染
+    # 等签到页内容渲染（积分签到页是 SPA，进入后需要时间出"今日签到状态"等文字）
     time.sleep(2)
     page_text = _visible_page_text(page)
 
-    # 检查是否已经签到
     if "今日签到状态" in page_text and (
         "已签到" in page_text and "未签到" not in page_text
     ):
@@ -395,12 +323,13 @@ def _execute_checkin_flow(page) -> str:
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    # 未签到：处理 Turnstile
+    # 签到页要求：先过 Cloudflare Turnstile，再点「立即签到」
     print("[checkin] 签到页：先处理 Cloudflare Turnstile")
     if not browser.solve_turnstile(page, timeout=60):
         browser.screenshot(page, "03c-checkin-turnstile-fail")
         raise TurnstileTimeout("签到页 Turnstile 未通过")
 
+    # 留一点缓冲，确保 token 已注入隐藏表单
     time.sleep(1.5)
     browser.screenshot(page, "03d-checkin-after-turnstile")
 
@@ -425,32 +354,6 @@ def _execute_checkin_flow(page) -> str:
     print("[checkin] 签到成功")
     return "签到成功"
 
-
-# ============================================================
-#  第四部分：主入口 do_checkin（编排混合策略）
-# ============================================================
-
-def do_checkin(page, email: str, password: str) -> str:
-    """主入口：先尝试 Cookie，失败则邮箱密码登录，最后执行签到。"""
-    # 1. 尝试 Cookie 登录
-    if _try_cookie_login(page):
-        print("[checkin] 使用 Cookie 登录成功，直接进入签到流程")
-        return _execute_checkin_flow(page)
-
-    # 2. Cookie 失败，走邮箱密码登录
-    print("[checkin] Cookie 不可用，降级为邮箱密码登录")
-    _login_with_email(page, email, password)
-
-    # 3. 登录成功后提取 Cookie，打印到控制台（供手动更新 Secrets）
-    _save_new_cookies_to_env(page)
-
-    # 4. 执行签到流程
-    return _execute_checkin_flow(page)
-
-
-# ============================================================
-#  第五部分：main 函数（入口 + 重试 + 通知）
-# ============================================================
 
 def _send_result_snapshot(page, status: str, filename: str) -> None:
     result_screenshot = browser.screenshot(page, filename)
