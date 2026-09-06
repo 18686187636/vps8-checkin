@@ -74,7 +74,6 @@ jobs:
         env:
           VPS8_EMAIL: ${{ secrets.VPS8_EMAIL }}
           VPS8_PASSWORD: ${{ secrets.VPS8_PASSWORD }}
-          VPS8_USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.64 Safari/537.36"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
