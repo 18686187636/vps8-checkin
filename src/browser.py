@@ -1,13 +1,16 @@
-"""DrissionPage 浏览器封装：反检测启动 + Turnstile 处理 + 截图。
+"""DrissionPage 浏览器封装：反检测启动 + 登录态注入 + Turnstile 处理 + 截图。
 
 约定：
 - 不开 --headless，Github Actions 上靠 xvfb-run 提供虚拟显示
 - 截图统一保存到项目根目录的 screenshots/ 下
 - Turnstile 处理实现多策略回退，提高过盾稳定性
+- 登录态通过 VPS8_STORAGE_STATE_B64 注入，不再走邮箱密码登录
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import platform
 import random
@@ -23,6 +26,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
+STORAGE_STATE_ENV = "VPS8_STORAGE_STATE_B64"
+TARGET_ORIGIN = "https://vps8.zz.cd"
 
 _CHROME_CANDIDATES = {
     "Darwin": [
@@ -35,6 +40,7 @@ _CHROME_CANDIDATES = {
         "/usr/bin/google-chrome-stable",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
     ],
     "Windows": [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -49,6 +55,15 @@ _PLATFORM_UA_PARTS = {
 }
 
 USER_AGENT_ENV = "VPS8_USER_AGENT"
+
+_SAMESITE_MAP = {
+    "unspecified": "Lax",
+    "no_restriction": "None",
+    "none": "None",
+    "lax": "Lax",
+    "strict": "Strict",
+    "": "Lax",
+}
 
 HAS_TURNSTILE_IFRAME_JS = r"""
 return Array.from(document.querySelectorAll('iframe')).some((frame) => {
@@ -115,6 +130,106 @@ return {
 """
 
 
+# ---------------------------------------------------------------------------
+# 登录态 cookies
+# ---------------------------------------------------------------------------
+
+def _normalize_cookies(raw: list[dict]) -> list[dict]:
+    """把浏览器扩展导出 / Playwright storage_state 的 cookie 数组
+    归一化为 DrissionPage page.set.cookies() 接受的格式。
+    """
+    out: list[dict] = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        value = c.get("value")
+        domain = c.get("domain")
+        if not (name and value and domain):
+            continue
+
+        # DrissionPage 不认 domain 前导的点
+        domain = str(domain).lstrip(".")
+
+        item = {
+            "name": str(name),
+            "value": str(value),
+            "domain": domain,
+            "path": c.get("path", "/") or "/",
+        }
+
+        if c.get("secure"):
+            item["secure"] = True
+        if c.get("httpOnly"):
+            item["httpOnly"] = True
+
+        ss = str(c.get("sameSite", "")).lower()
+        item["sameSite"] = _SAMESITE_MAP.get(ss, "Lax")
+
+        if c.get("session"):
+            item["expires"] = -1
+        elif "expirationDate" in c:
+            try:
+                item["expires"] = float(c["expirationDate"])
+            except (TypeError, ValueError):
+                item["expires"] = -1
+        elif "expires" in c:
+            try:
+                item["expires"] = float(c["expires"])
+            except (TypeError, ValueError):
+                item["expires"] = -1
+        else:
+            item["expires"] = -1
+
+        out.append(item)
+    return out
+
+
+def load_cookies_from_env() -> list[dict]:
+    """从 VPS8_STORAGE_STATE_B64 读取并解码 cookies。
+
+    兼容两种输入：
+    - 浏览器扩展（Cookie-Editor）导出的 JSON 数组
+    - Playwright storage_state（{"cookies": [...], "origins": [...]}）
+    """
+    raw = os.environ.get(STORAGE_STATE_ENV, "").strip()
+    if not raw:
+        raise RuntimeError(f"环境变量 {STORAGE_STATE_ENV} 未设置")
+
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+    except Exception as exc:
+        raise RuntimeError(f"{STORAGE_STATE_ENV} base64 解码失败: {exc}") from exc
+
+    try:
+        parsed = json.loads(decoded)
+    except Exception as exc:
+        raise RuntimeError(f"{STORAGE_STATE_ENV} JSON 解析失败: {exc}") from exc
+
+    if isinstance(parsed, dict):
+        parsed = parsed.get("cookies", [])
+    if not isinstance(parsed, list) or not parsed:
+        raise RuntimeError(f"{STORAGE_STATE_ENV} 内容为空或格式不正确")
+
+    cookies = _normalize_cookies(parsed)
+    if not cookies:
+        raise RuntimeError(f"{STORAGE_STATE_ENV} 中没有有效的 cookie")
+
+    print(f"[browser] 已从环境变量加载 {len(cookies)} 条 cookies:")
+    for c in cookies:
+        exp = c.get("expires", -1)
+        exp_str = "session" if exp == -1 else time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(exp)
+        )
+        print(f"[browser]   - {c['name']} (domain={c['domain']}, expires={exp_str})")
+
+    return cookies
+
+
+# ---------------------------------------------------------------------------
+# Chrome 路径 / UA
+# ---------------------------------------------------------------------------
+
 def _detect_chrome_path() -> Optional[str]:
     env_path = os.environ.get("CHROME_PATH")
     if env_path and os.path.exists(env_path):
@@ -167,7 +282,11 @@ def _resolve_user_agent(chrome_path: Optional[str]) -> Optional[str]:
     return _build_user_agent(chrome_path)
 
 
-def create_page() -> ChromiumPage:
+# ---------------------------------------------------------------------------
+# 创建页面
+# ---------------------------------------------------------------------------
+
+def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
     co = ChromiumOptions()
 
     co.set_argument("--disable-blink-features=AutomationControlled")
@@ -199,8 +318,45 @@ def create_page() -> ChromiumPage:
         print(f"[browser] 使用 User-Agent: {user_agent}")
 
     page = ChromiumPage(co)
+
+    if cookies:
+        _inject_cookies(page, cookies)
+
     return page
 
+
+def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
+    """注入 cookies。
+
+    DrissionPage 的 set.cookies 需要在目标域下调用才稳妥，
+    所以先访问一次目标站点，再写入 cookie，最后重载 dashboard 校验。
+    """
+    print(f"[browser] 准备注入 {len(cookies)} 条 cookies，先访问 {TARGET_ORIGIN}")
+    try:
+        page.get(TARGET_ORIGIN)
+        time.sleep(1.0)
+    except Exception as exc:
+        print(f"[browser] 访问目标域失败: {exc}")
+
+    try:
+        page.set.cookies(cookies)
+        print("[browser] cookies 注入完成")
+    except Exception as exc:
+        print(f"[browser] cookies 注入失败: {exc}")
+        raise
+
+    # 重新加载一次，让服务器看到 cookie
+    try:
+        page.get(TARGET_ORIGIN + "/dashboard")
+        time.sleep(1.5)
+        print(f"[browser] cookie 生效校验，当前 URL: {page.url}")
+    except Exception as exc:
+        print(f"[browser] 校验 cookie 时访问 dashboard 失败: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# 截图
+# ---------------------------------------------------------------------------
 
 def clean_screenshots() -> int:
     removed = 0
@@ -228,6 +384,10 @@ def screenshot(page: ChromiumPage, name: str, full_page: bool = False) -> Option
         print(f"[browser] 截图失败 ({name}): {exc}")
         return None
 
+
+# ---------------------------------------------------------------------------
+# Turnstile
+# ---------------------------------------------------------------------------
 
 def wait_turnstile_iframe(page: ChromiumPage, timeout: int = 30) -> bool:
     """等待 Cloudflare Turnstile iframe 加载出来。"""
