@@ -1,12 +1,9 @@
-"""DrissionPage 浏览器封装：反检测启动 + 登录态注入 + Turnstile 处理 + 截图。
+"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + Turnstile 处理 + 截图。
 
 约定：
 - 不开 --headless，Github Actions 上靠 xvfb-run 提供虚拟显示
 - 截图统一保存到项目根目录的 screenshots/ 下
-- Turnstile 处理实现多策略回退，提高过盾稳定性
-- 登录态通过 VPS8_STORAGE_STATE_B64 注入，不再走邮箱密码登录
-- 若设置了 VPS8_PROXY，浏览器走该代理（SOCKS5 或 HTTP）
-- cookie 注入后直接访问 /dashboard，不访问首页（首页会重置 session）
+- 登录方式：注入 GitHub session cookies → 点 GitHub OAuth → 静默登录 vps8
 """
 
 from __future__ import annotations
@@ -28,14 +25,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-STORAGE_STATE_ENV = "VPS8_STORAGE_STATE_B64"
+GITHUB_SESSION_ENV = "VPS8_GITHUB_SESSION_B64"
 PROXY_ENV = "VPS8_PROXY"
-TARGET_ORIGIN = "https://vps8.zz.cd"
+
+VPS8_BASE = "https://vps8.zz.cd"
+VPS8_LOGIN_URL = f"{VPS8_BASE}/login"
+VPS8_DASHBOARD_URL = f"{VPS8_BASE}/dashboard"
+GITHUB_BASE = "https://github.com/"
 
 _CHROME_CANDIDATES = {
     "Darwin": [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
     ],
     "Linux": [
@@ -86,7 +86,6 @@ const isVisible = (el) => {
   const style = window.getComputedStyle(el);
   return style.display !== 'none' && style.visibility !== 'hidden';
 };
-
 const isTurnstileFrame = (frame) => {
   const src = frame.getAttribute('src') || '';
   const title = frame.getAttribute('title') || '';
@@ -94,13 +93,9 @@ const isTurnstileFrame = (frame) => {
     || title.toLowerCase().includes('cloudflare')
     || title.toLowerCase().includes('challenge');
 };
-
 let target = null;
 let source = '';
-
-const containerIframes = document.querySelectorAll(
-  '.cf-turnstile iframe, [data-sitekey] iframe'
-);
+const containerIframes = document.querySelectorAll('.cf-turnstile iframe, [data-sitekey] iframe');
 for (const f of containerIframes) {
   if (isVisible(f)) { target = f; source = 'container-iframe'; break; }
 }
@@ -116,23 +111,18 @@ if (!target) {
   }
 }
 if (!target) return null;
-
 const rect = target.getBoundingClientRect();
 return {
-  source,
-  tag: target.tagName.toLowerCase(),
+  source, tag: target.tagName.toLowerCase(),
   cls: target.className ? String(target.className).slice(0, 80) : '',
   sitekey: (target.closest('[data-sitekey]') || target).getAttribute('data-sitekey') || '',
-  x: rect.x,
-  y: rect.y,
-  width: rect.width,
-  height: rect.height,
+  x: rect.x, y: rect.y, width: rect.width, height: rect.height,
 };
 """
 
 
 # ---------------------------------------------------------------------------
-# 登录态 cookies
+# GitHub session 加载
 # ---------------------------------------------------------------------------
 
 def _normalize_cookies(raw: list[dict]) -> list[dict]:
@@ -145,24 +135,19 @@ def _normalize_cookies(raw: list[dict]) -> list[dict]:
         domain = c.get("domain")
         if not (name and value and domain):
             continue
-
         domain = str(domain).lstrip(".")
-
         item = {
             "name": str(name),
             "value": str(value),
             "domain": domain,
             "path": c.get("path", "/") or "/",
         }
-
         if c.get("secure"):
             item["secure"] = True
         if c.get("httpOnly"):
             item["httpOnly"] = True
-
         ss = str(c.get("sameSite", "")).lower()
         item["sameSite"] = _SAMESITE_MAP.get(ss, "Lax")
-
         if c.get("session"):
             item["expires"] = -1
         elif "expirationDate" in c:
@@ -177,43 +162,30 @@ def _normalize_cookies(raw: list[dict]) -> list[dict]:
                 item["expires"] = -1
         else:
             item["expires"] = -1
-
         out.append(item)
     return out
 
 
-def load_cookies_from_env() -> list[dict]:
-    raw = os.environ.get(STORAGE_STATE_ENV, "").strip()
+def load_github_session_from_env() -> list[dict]:
+    raw = os.environ.get(GITHUB_SESSION_ENV, "").strip()
     if not raw:
-        raise RuntimeError(f"环境变量 {STORAGE_STATE_ENV} 未设置")
-
+        raise RuntimeError(f"环境变量 {GITHUB_SESSION_ENV} 未设置")
     try:
-        decoded = base64.b64decode(raw).decode("utf-8")
+        parsed = json.loads(base64.b64decode(raw).decode("utf-8"))
     except Exception as exc:
-        raise RuntimeError(f"{STORAGE_STATE_ENV} base64 解码失败: {exc}") from exc
-
-    try:
-        parsed = json.loads(decoded)
-    except Exception as exc:
-        raise RuntimeError(f"{STORAGE_STATE_ENV} JSON 解析失败: {exc}") from exc
-
+        raise RuntimeError(f"{GITHUB_SESSION_ENV} 解码失败: {exc}") from exc
     if isinstance(parsed, dict):
-        parsed = parsed.get("cookies", [])
-    if not isinstance(parsed, list) or not parsed:
-        raise RuntimeError(f"{STORAGE_STATE_ENV} 内容为空或格式不正确")
-
-    cookies = _normalize_cookies(parsed)
+        cookies_raw = parsed.get("cookies", [])
+    else:
+        cookies_raw = parsed
+    if not cookies_raw:
+        raise RuntimeError(f"{GITHUB_SESSION_ENV} 中没有 cookie")
+    cookies = _normalize_cookies(cookies_raw)
     if not cookies:
-        raise RuntimeError(f"{STORAGE_STATE_ENV} 中没有有效的 cookie")
-
-    print(f"[browser] 已从环境变量加载 {len(cookies)} 条 cookies:")
+        raise RuntimeError(f"{GITHUB_SESSION_ENV} 中没有有效的 cookie")
+    print(f"[browser] 已加载 {len(cookies)} 条 GitHub cookies:")
     for c in cookies:
-        exp = c.get("expires", -1)
-        exp_str = "session" if exp == -1 else time.strftime(
-            "%Y-%m-%d %H:%M", time.localtime(exp)
-        )
-        print(f"[browser]   - {c['name']} (domain={c['domain']}, expires={exp_str})")
-
+        print(f"[browser]   - {c['name']} (domain={c['domain']})")
     return cookies
 
 
@@ -225,9 +197,7 @@ def _detect_chrome_path() -> Optional[str]:
     env_path = os.environ.get("CHROME_PATH")
     if env_path and os.path.exists(env_path):
         return env_path
-
-    candidates = _CHROME_CANDIDATES.get(platform.system(), [])
-    for p in candidates:
+    for p in _CHROME_CANDIDATES.get(platform.system(), []):
         if os.path.exists(p):
             return p
     return None
@@ -236,33 +206,23 @@ def _detect_chrome_path() -> Optional[str]:
 def _build_user_agent(chrome_path: Optional[str]) -> Optional[str]:
     if not chrome_path:
         return None
-
     try:
         result = subprocess.run(
-            [chrome_path, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            [chrome_path, "--version"], check=False,
+            capture_output=True, text=True, timeout=5,
         )
-    except Exception as exc:
-        print(f"[browser] 获取 Chrome 版本失败: {exc}")
+    except Exception:
         return None
-
     version_text = (result.stdout or result.stderr or "").strip()
     match = re.search(r"(\d+\.\d+\.\d+\.\d+)", version_text)
     if not match:
-        print(f"[browser] 未能解析 Chrome 版本: {version_text}")
         return None
-
     platform_part = _PLATFORM_UA_PARTS.get(platform.system())
     if not platform_part:
         return None
-
-    version = match.group(1)
     return (
         f"Mozilla/5.0 ({platform_part}) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+        f"(KHTML, like Gecko) Chrome/{match.group(1)} Safari/537.36"
     )
 
 
@@ -274,14 +234,11 @@ def _resolve_user_agent(chrome_path: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 创建页面 / 注入 cookie
+# 创建页面
 # ---------------------------------------------------------------------------
 
-def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
-    print(f"[browser] create_page 收到 cookies: {len(cookies) if cookies else 0} 条")
-
+def create_page() -> ChromiumPage:
     co = ChromiumOptions()
-
     co.set_argument("--disable-blink-features=AutomationControlled")
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-dev-shm-usage")
@@ -291,12 +248,10 @@ def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
     co.set_argument("--lang=zh-CN,zh;q=0.9,en;q=0.8")
     co.set_argument("--window-size=1280,800")
     co.set_argument("--force-device-scale-factor=1")
-
     co.set_pref("devtools.preferences.currentDockState", '"undocked"')
     co.set_pref("credentials_enable_service", False)
     co.set_pref("profile.password_manager_enabled", False)
 
-    # ---- 代理配置 ----
     proxy = os.environ.get(PROXY_ENV, "").strip()
     if proxy:
         print(f"[browser] 使用代理: {proxy}")
@@ -313,103 +268,118 @@ def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
     if chrome_path:
         co.set_browser_path(chrome_path)
         print(f"[browser] 使用 Chrome: {chrome_path}")
-    else:
-        print("[browser] 未找到 Chrome 二进制，将使用 DrissionPage 默认查找逻辑")
 
     user_agent = _resolve_user_agent(chrome_path)
     if user_agent:
         co.set_user_agent(user_agent)
         print(f"[browser] 使用 User-Agent: {user_agent}")
 
-    page = ChromiumPage(co)
-
-    if cookies:
-        print(f"[browser] create_page 内部准备注入 {len(cookies)} 条 cookies")
-        _inject_cookies(page, cookies)
-    else:
-        print("[browser] create_page 未收到 cookies（将由调用方显式注入）")
-
-    return page
+    return ChromiumPage(co)
 
 
-def apply_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
-    """显式注入 cookies，供 checkin.py 调用，避免参数传递丢失。"""
-    if not cookies:
-        print("[browser] apply_cookies 收到空 cookies，跳过")
-        return
-    print(f"[browser] apply_cookies 开始注入 {len(cookies)} 条 cookies")
-    _inject_cookies(page, cookies)
+# ---------------------------------------------------------------------------
+# GitHub OAuth 登录
+# ---------------------------------------------------------------------------
+
+def _dump_github_cookies(page: ChromiumPage) -> None:
+    try:
+        actual = page.cookies(as_dict=False)
+        gh = [c for c in actual if "github.com" in str(c.get("domain") or "").lower()]
+        print(f"[browser] 浏览器中 GitHub cookies: {len(gh)} 条")
+        for c in gh:
+            print(f"[browser]   {c.get('name')} = {str(c.get('value'))[:12]}...")
+    except Exception as exc:
+        print(f"[browser] 读取 GitHub cookie 失败: {exc}")
 
 
-def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
-    """先 set 再 get，直接访问 /dashboard，不访问首页。
-
-    重要：/（首页）会让 FOSSBilling 重置会话，把我们的 PHPSESSID 覆盖掉。
-    """
-    print(f"[browser] 准备注入 {len(cookies)} 条 cookies")
-    for c in cookies:
-        print(f"[browser]   将要注入: {c['name']}={c['value'][:16]}...")
+def inject_github_session(page: ChromiumPage, cookies: list[dict]) -> None:
+    """把 GitHub session cookies 注入浏览器。"""
+    print(f"[browser] 访问 {GITHUB_BASE} 以准备注入 GitHub cookies")
+    try:
+        page.get(GITHUB_BASE)
+        time.sleep(2)
+    except Exception as exc:
+        print(f"[browser] 访问 GitHub 失败: {exc}")
 
     try:
         page.set.cookies(cookies, set_domain=True)
-        print("[browser] set.cookies(..., set_domain=True) 调用完成")
     except TypeError:
+        page.set.cookies(cookies)
+    print(f"[browser] 已注入 {len(cookies)} 条 GitHub cookies")
+    _dump_github_cookies(page)
+
+
+def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
+    """访问 vps8 登录页，点 GitHub 按钮，等待 OAuth 跳回 vps8 的 dashboard。"""
+    print(f"[browser] 打开 vps8 登录页: {VPS8_LOGIN_URL}")
+    page.get(VPS8_LOGIN_URL)
+    time.sleep(2.5)
+
+    # 点 GitHub 按钮
+    click_js = r"""
+    const isVisible = (el) => {
+      const s = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    };
+    const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+    const target = candidates.find((el) => {
+      if (!isVisible(el)) return false;
+      const href = (el.getAttribute('href') || '').toLowerCase();
+      const text = (el.innerText || el.textContent || '').toLowerCase();
+      return href.includes('/github/login') || text.includes('github');
+    });
+    if (!target) return false;
+    target.scrollIntoView({block: 'center', inline: 'center'});
+    target.click();
+    return true;
+    """
+    if not page.run_js(click_js):
+        browser_screenshot = screenshot(page, "10-no-github-button")
+        raise RuntimeError("找不到 GitHub 登录按钮")
+
+    print("[browser] 已点击 GitHub 登录，等待跳转...")
+
+    deadline = time.time() + timeout
+    last_url = ""
+    authorize_clicked = False
+
+    while time.time() < deadline:
         try:
-            page.set.cookies(cookies)
-            print("[browser] set.cookies(...) 调用完成（老版本 API）")
-        except Exception as exc:
-            print(f"[browser] set.cookies 失败: {exc}")
-            raise
-    except Exception as exc:
-        print(f"[browser] set.cookies 失败: {exc}")
-        raise
+            url = page.url
+        except Exception:
+            url = ""
 
-    try:
-        actual = page.cookies(as_dict=False)
-        print(f"[browser] 注入后浏览器实际 cookie 数量: {len(actual)}")
-        for c in actual:
-            name = c.get("name")
-            val = str(c.get("value", ""))
-            domain = c.get("domain", "")
-            print(f"[browser]   actual: {name}={val[:16]}... (domain={domain})")
-    except Exception as exc:
-        print(f"[browser] 读取注入结果失败: {exc}")
+        if url and url != last_url:
+            print(f"[browser] URL: {url}")
+            last_url = url
 
-    # 打印当前出口 IP
-    try:
-        page.get("https://api.ipify.org/?format=text")
+        # 如果落在 GitHub 的 OAuth 授权页，点 Authorize
+        if "github.com" in url and ("/login/oauth/authorize" in url or "/oauth/authorize" in url):
+            if not authorize_clicked:
+                click_auth_js = r"""
+                const btn = document.querySelector('button[name="authorize"]')
+                  || Array.from(document.querySelectorAll('button')).find(b =>
+                       (b.innerText || '').toLowerCase().includes('authorize'));
+                if (btn) { btn.click(); return true; }
+                return false;
+                """
+                if page.run_js(click_auth_js):
+                    print("[browser] 已点击 GitHub Authorize")
+                    authorize_clicked = True
+                    time.sleep(3)
+                    continue
+
+        # 完成：回到 vps8 且不在 login
+        if "vps8.zz.cd" in url and "/login" not in url and "/github" not in url:
+            print(f"[browser] OAuth 完成，当前 URL: {url}")
+            time.sleep(2.5)
+            return
+
         time.sleep(1)
-        ip_text = (page.run_js("return document.body ? document.body.innerText : '';") or "").strip()
-        print(f"[browser] 当前出口 IP: {ip_text}")
-    except Exception as exc:
-        print(f"[browser] 获取出口 IP 失败: {exc}")
 
-    # 关键：直接访问 /dashboard，绕过首页
-    try:
-        page.get(TARGET_ORIGIN + "/dashboard")
-        time.sleep(2)
-        print(f"[browser] 访问 dashboard 后 URL: {page.url}")
-        try:
-            resp = page.response
-            print(f"[browser] dashboard 响应状态: {resp.status if resp else 'N/A'}")
-        except Exception:
-            pass
-        try:
-            title = page.run_js("return document.title || '';")
-            print(f"[browser] dashboard 页面 title: {title!r}")
-        except Exception:
-            pass
-        try:
-            actual_after = page.cookies(as_dict=False)
-            print(f"[browser] 访问后浏览器 cookie 数量: {len(actual_after)}")
-            for c in actual_after:
-                name = c.get("name")
-                val = str(c.get("value", ""))
-                print(f"[browser]   after: {name}={val[:16]}...")
-        except Exception as exc:
-            print(f"[browser] 读取访问后 cookie 失败: {exc}")
-    except Exception as exc:
-        print(f"[browser] 访问 dashboard 失败: {exc}")
+    screenshot(page, "10-oauth-timeout")
+    raise RuntimeError(f"GitHub OAuth 超时，当前 URL: {page.url}")
 
 
 # ---------------------------------------------------------------------------
@@ -419,14 +389,11 @@ def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
 def clean_screenshots() -> int:
     removed = 0
     for path in SCREENSHOT_DIR.glob("*.png"):
-        if not path.is_file():
-            continue
         try:
             path.unlink()
             removed += 1
         except Exception as exc:
             print(f"[browser] 清理截图失败 ({path}): {exc}")
-
     if removed:
         print(f"[browser] 已清理旧截图: {removed} 个")
     return removed
@@ -447,15 +414,6 @@ def screenshot(page: ChromiumPage, name: str, full_page: bool = False) -> Option
 # Turnstile
 # ---------------------------------------------------------------------------
 
-def wait_turnstile_iframe(page: ChromiumPage, timeout: int = 30) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _has_turnstile_iframe(page):
-            return True
-        time.sleep(0.5)
-    return False
-
-
 def _has_turnstile_widget(page: ChromiumPage) -> bool:
     try:
         return bool(page.run_js("return !!document.querySelector('.cf-turnstile, [data-sitekey]');")) \
@@ -473,9 +431,6 @@ def wait_turnstile_widget(page: ChromiumPage, timeout: int = 30) -> bool:
     return False
 
 
-wait_turnstile_iframe = wait_turnstile_widget
-
-
 def solve_turnstile(
     page: ChromiumPage,
     timeout: int = 30,
@@ -483,7 +438,7 @@ def solve_turnstile(
     require_iframe: bool = True,
 ) -> bool:
     if require_iframe and not wait_turnstile_widget(page, timeout=min(timeout, 20)):
-        print("[turnstile] 未检测到 Turnstile widget（页面可能没有盾）")
+        print("[turnstile] 未检测到 Turnstile widget")
         return False
 
     try:
@@ -491,59 +446,44 @@ def solve_turnstile(
         if info:
             print(
                 "[turnstile] 定位到 widget: "
-                f"source={info.get('source')}, tag={info.get('tag')}, "
-                f"cls={info.get('cls')!r}, "
-                f"sitekey={(info.get('sitekey') or '')[:12]}..., "
+                f"source={info.get('source')}, "
                 f"pos=({info.get('x'):.0f},{info.get('y'):.0f}), "
                 f"size=({info.get('width'):.0f}x{info.get('height'):.0f})"
             )
-        else:
-            print("[turnstile] 未能定位 widget 元素")
     except Exception as exc:
         print(f"[turnstile] 读取 widget 信息失败: {exc}")
 
     if _turnstile_token(page):
-        print("[turnstile] 已存在 response token，盾已通过")
+        print("[turnstile] 已存在 response token")
         return True
 
     deadline = time.time() + timeout
     attempts = 0
-
     while time.time() < deadline:
         attempts += 1
-
         clicked = _click_turnstile_checkbox(page)
-        if clicked:
-            print(f"[turnstile] 第 {attempts} 次尝试点击完成，等盾通过")
-        else:
-            print(f"[turnstile] 第 {attempts} 次尝试未能点击")
-
+        print(f"[turnstile] 第 {attempts} 次尝试点击: {'成功' if clicked else '失败'}")
         if _wait_for_pass(page, timeout=8):
             time.sleep(1.5)
             print(f"[turnstile] 盾通过 (尝试 {attempts} 次)")
             return True
-
         time.sleep(poll_interval)
 
-    print(f"[turnstile] {timeout}s 内未能完成验证 (共尝试 {attempts} 次)")
+    print(f"[turnstile] {timeout}s 内未通过")
     return False
 
 
 def _click_turnstile_checkbox(page: ChromiumPage) -> bool:
     try:
         info = page.run_js(LOCATE_TURNSTILE_WIDGET_JS)
-    except Exception as exc:
-        print(f"[turnstile] 获取 widget 坐标失败: {exc}")
+    except Exception:
         return False
-
     if not info:
-        print("[turnstile] widget 未找到")
         return False
 
     width = float(info.get("width") or 0)
     height = float(info.get("height") or 0)
     if width < 30 or height < 20:
-        print(f"[turnstile] widget 尺寸异常: {width}x{height}")
         return False
 
     try:
@@ -562,32 +502,15 @@ def _click_turnstile_checkbox(page: ChromiumPage) -> bool:
     y = int(base_y + random.randint(-3, 3))
 
     try:
-        page.run_cdp(
-            "Input.dispatchMouseEvent",
-            type="mouseMoved",
-            x=x - 15,
-            y=y - 5,
-        )
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x - 15, y=y - 5)
         time.sleep(random.uniform(0.15, 0.3))
         page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
         time.sleep(random.uniform(0.2, 0.4))
-        page.run_cdp(
-            "Input.dispatchMouseEvent",
-            type="mousePressed",
-            x=x,
-            y=y,
-            button="left",
-            clickCount=1,
-        )
+        page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
+                     x=x, y=y, button="left", clickCount=1)
         time.sleep(random.uniform(0.08, 0.18))
-        page.run_cdp(
-            "Input.dispatchMouseEvent",
-            type="mouseReleased",
-            x=x,
-            y=y,
-            button="left",
-            clickCount=1,
-        )
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
+                     x=x, y=y, button="left", clickCount=1)
         print(f"[turnstile] 已在 ({x},{y}) 模拟点击")
         return True
     except Exception as exc:
@@ -595,105 +518,9 @@ def _click_turnstile_checkbox(page: ChromiumPage) -> bool:
         return False
 
 
-def _has_turnstile_iframe(page: ChromiumPage) -> bool:
-    try:
-        return bool(page.run_js(HAS_TURNSTILE_IFRAME_JS))
-    except Exception:
-        return False
-
-
-def _try_click_via_iframe(page: ChromiumPage, by_title: bool) -> bool:
-    try:
-        if by_title:
-            iframe = page.get_frame("@title:Cloudflare", timeout=2)
-        else:
-            iframe = page.get_frame(
-                "@@tag()=iframe@@src:challenges.cloudflare.com",
-                timeout=2,
-            )
-        if not iframe:
-            return False
-
-        checkbox = iframe.ele("xpath://input[@type='checkbox']", timeout=3)
-        if not checkbox:
-            return False
-        checkbox.click()
-        return True
-    except Exception as exc:
-        print(f"[turnstile] iframe 点击失败 ({'title' if by_title else 'src'}): {exc}")
-        return False
-
-
-def _try_click_iframe_element(page: ChromiumPage) -> bool:
-    try:
-        iframe_ele = page.ele(
-            "@@tag()=iframe@@src:challenges.cloudflare.com",
-            timeout=2,
-        )
-        if not iframe_ele:
-            return False
-        iframe_ele.click.at(30, iframe_ele.rect.size[1] // 2)
-        return True
-    except Exception as exc:
-        print(f"[turnstile] iframe 偏移点击失败: {exc}")
-        return False
-
-
-def _try_click_visible_iframe(page: ChromiumPage) -> bool:
-    try:
-        iframes = page.eles("tag:iframe", timeout=2)
-        for iframe_ele in iframes:
-            width, height = iframe_ele.rect.size
-            if width < 100 or height < 40:
-                continue
-            iframe_ele.click.at(30, height // 2)
-            return True
-        return False
-    except Exception as exc:
-        print(f"[turnstile] 可见 iframe 点击失败: {exc}")
-        return False
-
-
-def _try_click_checkbox_by_viewport(page: ChromiumPage) -> bool:
-    try:
-        viewport = page.run_js(
-            "return {width: window.innerWidth, height: window.innerHeight};"
-        )
-        width = int(viewport["width"])
-        height = int(viewport["height"])
-        x = width // 2 - 132 + random.randint(-3, 3)
-        y = height // 2 - 13 + random.randint(-3, 3)
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x - 20, y=y - 8)
-        time.sleep(random.uniform(0.15, 0.35))
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
-        time.sleep(random.uniform(0.2, 0.45))
-        page.run_cdp(
-            "Input.dispatchMouseEvent",
-            type="mousePressed",
-            x=x,
-            y=y,
-            button="left",
-            clickCount=1,
-        )
-        time.sleep(random.uniform(0.08, 0.18))
-        page.run_cdp(
-            "Input.dispatchMouseEvent",
-            type="mouseReleased",
-            x=x,
-            y=y,
-            button="left",
-            clickCount=1,
-        )
-        return True
-    except Exception as exc:
-        print(f"[turnstile] 视口坐标点击失败: {exc}")
-        return False
-
-
 def _turnstile_token(page: ChromiumPage) -> str:
     try:
-        token = page.run_js(
-            r"""
+        token = page.run_js(r"""
             const inputs = document.querySelectorAll(
               'input[name="cf-turnstile-response"], input[name^="cf-chl-widget"]'
             );
@@ -701,8 +528,7 @@ def _turnstile_token(page: ChromiumPage) -> str:
               if (el.value) return el.value;
             }
             return '';
-            """
-        )
+        """)
         return token or ""
     except Exception:
         return ""
