@@ -1,7 +1,7 @@
 """DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
 
 使用 Chrome for Testing 136（保留 --load-extension）加载 NoneCap 扩展自动解决 hCaptcha。
-GitHub 按钮和 Authorize 按钮使用 CDP 真实鼠标事件点击，避免被识别为自动化操作。
+GitHub 登录优先直接 GET /github/login，绕过按钮点击；Authorize 按钮用 CDP 真实鼠标事件点击。
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ NONECAP_EXT_ENV = "NONECAP_EXT_PATH"
 
 VPS8_BASE = "https://vps8.zz.cd"
 VPS8_LOGIN_URL = f"{VPS8_BASE}/login"
+VPS8_GITHUB_LOGIN_URL = f"{VPS8_BASE}/github/login"
 VPS8_DASHBOARD_URL = f"{VPS8_BASE}/dashboard"
 GITHUB_BASE = "https://github.com/"
 
@@ -291,10 +292,7 @@ def create_page() -> ChromiumPage:
 # ---------------------------------------------------------------------------
 
 def _cdp_click_element(page: ChromiumPage, find_element_expr: str) -> bool:
-    """find_element_expr 必须是**表达式**（返回 DOM 元素或 null）。
-
-    用 JSON.stringify 返回结果，避免 DrissionPage 对不同返回值类型的处理差异。
-    """
+    """find_element_expr 必须是**表达式**（返回 DOM 元素或 null）。"""
     js = f"""
     (function() {{
         try {{
@@ -508,6 +506,29 @@ def is_logged_in(page: ChromiumPage) -> bool:
         return False
 
 
+def _click_github_login_button(page: ChromiumPage) -> bool:
+    """点 GitHub 登录按钮：优先 ele.click()，兜底 CDP。"""
+    # 方式 A：DrissionPage 原生 click
+    try:
+        ele = page.ele("xpath://a[contains(@href, '/github/login')]", timeout=5)
+        if ele is None:
+            ele = page.ele("xpath://a[contains(text(), 'GitHub')]", timeout=2)
+        if ele:
+            ele.click()
+            print("[browser] ele.click() 点击 GitHub 按钮成功")
+            return True
+    except Exception as exc:
+        print(f"[browser] ele.click() 失败: {exc}")
+
+    # 方式 B：CDP 真实鼠标事件
+    if page.run_js(f"return !!({FIND_GITHUB_LOGIN_BTN_JS});"):
+        if _cdp_click_element(page, FIND_GITHUB_LOGIN_BTN_JS):
+            print("[browser] CDP 点击 GitHub 按钮成功")
+            return True
+
+    return False
+
+
 def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
     # ---- 1. 先检查是否已经登录 ----
     print("[browser] 先检查 vps8 登录态...")
@@ -517,56 +538,37 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
     print("[browser] 未登录，走 GitHub OAuth 流程")
 
-    # ---- 2. 打开登录页 ----
-    print(f"[browser] 打开 vps8 登录页: {VPS8_LOGIN_URL}")
-    page.get(VPS8_LOGIN_URL)
+    # ---- 2. 直接 GET /github/login，绕过按钮 ----
+    print(f"[browser] 直接访问: {VPS8_GITHUB_LOGIN_URL}")
+    page.get(VPS8_GITHUB_LOGIN_URL)
     time.sleep(4)
+    print(f"[browser] 访问后 URL: {page.url}")
 
-    if "vps8.zz.cd" in (page.url or "") and "/login" not in (page.url or ""):
-        print(f"[browser] 打开登录页后已被重定向到: {page.url}，视为已登录")
-        return
-
-    # ---- 3. 找 GitHub 按钮（最多 3 次）----
-    found = False
-    for i in range(3):
-        try:
-            if page.run_js(f"return !!({FIND_GITHUB_LOGIN_BTN_JS});"):
-                found = True
-                break
-        except Exception as exc:
-            print(f"[browser] 检测 GitHub 按钮异常: {exc}")
-        print(f"[browser] 第 {i + 1} 次未找到 GitHub 按钮，等 3 秒再试")
+    # 如果 /github/login 没有触发跳转，说明服务端需要从登录页点按钮
+    if "vps8.zz.cd" in (page.url or "") and "/login" in (page.url or ""):
+        print("[browser] /github/login 未触发跳转，回退到点击按钮")
+        page.get(VPS8_LOGIN_URL)
         time.sleep(3)
 
-    if not found:
-        print("[browser] ❌ 找不到 GitHub 按钮，dump 页面内容：")
-        _dump_page_elements(page)
-        screenshot(page, "10-no-github-button")
-        raise RuntimeError("找不到 GitHub 登录按钮")
+        if not page.run_js(f"return !!({FIND_GITHUB_LOGIN_BTN_JS});"):
+            print("[browser] ❌ 找不到 GitHub 按钮，dump 页面内容：")
+            _dump_page_elements(page)
+            screenshot(page, "10-no-github-button")
+            raise RuntimeError("找不到 GitHub 登录按钮")
 
-    # ---- 4. CDP 点击 GitHub 按钮 ----
-    if not _cdp_click_element(page, FIND_GITHUB_LOGIN_BTN_JS):
-        screenshot(page, "10-github-click-failed")
-        print("[browser] CDP 点击失败，尝试 DrissionPage ele.click() 兜底")
-        try:
-            ele = page.ele("xpath://a[contains(@href, '/github/login')]", timeout=5)
-            if ele:
-                ele.click()
-                print("[browser] ele.click() 兜底点击成功")
-            else:
-                print("[browser] 兜底也未找到元素")
-                raise RuntimeError("CDP 点击 GitHub 按钮失败")
-        except Exception as exc:
-            print(f"[browser] 兜底点击异常: {exc}")
-            raise RuntimeError("CDP 点击 GitHub 按钮失败") from exc
+        if not _click_github_login_button(page):
+            screenshot(page, "10-github-click-failed")
+            raise RuntimeError("无法点击 GitHub 登录按钮")
 
-    print("[browser] 已点击 GitHub 登录，等待跳转...")
+        time.sleep(3)
+        print(f"[browser] 点击后 URL: {page.url}")
 
-    # ---- 5. 等待 OAuth 流程 ----
+    # ---- 3. 等待 OAuth 流程 ----
     deadline = time.time() + timeout
     last_url = ""
     authorize_attempts = 0
     MAX_AUTHORIZE_ATTEMPTS = 3
+    stuck_at_login_since = 0.0
 
     while time.time() < deadline:
         try:
@@ -577,6 +579,7 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
             print(f"[browser] URL: {url}")
             last_url = url
 
+        # access_denied → 重试
         if "access_denied" in url or "error=access_denied" in url:
             authorize_attempts += 1
             print(f"[browser] ⚠️ access_denied（第 {authorize_attempts} 次）")
@@ -586,14 +589,13 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
                     f"GitHub 连续 {MAX_AUTHORIZE_ATTEMPTS} 次拒绝授权，"
                     "请检查 VPS8_GITHUB_SESSION_B64 是否有效"
                 )
-            print("[browser] 返回登录页重试...")
-            page.get(VPS8_LOGIN_URL)
+            print("[browser] 重试 GET /github/login...")
+            page.get(VPS8_GITHUB_LOGIN_URL)
             time.sleep(3)
-            if not _cdp_click_element(page, FIND_GITHUB_LOGIN_BTN_JS):
-                raise RuntimeError("重试时找不到 GitHub 登录按钮")
-            time.sleep(3)
+            stuck_at_login_since = 0
             continue
 
+        # GitHub 授权页 → 点 Authorize
         if "github.com" in url and ("/login/oauth/authorize" in url or "/oauth/authorize" in url):
             print("[browser] 检测到 GitHub 授权页，dump 按钮信息")
             _dump_buttons(page)
@@ -602,27 +604,41 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
                 print("[browser] 已点击 Authorize 按钮（CDP）")
                 time.sleep(3)
                 continue
-            else:
-                print("[browser] CDP 点击 Authorize 失败，尝试 ele 兜底")
-                try:
-                    ele = page.ele(
-                        "xpath://button[@name='authorize' and @value='1']",
-                        timeout=5,
-                    )
-                    if ele:
-                        ele.click()
-                        print("[browser] ele.click() 点击 Authorize 成功")
-                        time.sleep(3)
-                        continue
-                except Exception as exc:
-                    print(f"[browser] 兜底点击 Authorize 异常: {exc}")
-                screenshot(page, "10-no-authorize-btn")
-                raise RuntimeError("GitHub 授权页找不到 Authorize 按钮")
 
+            print("[browser] CDP 点击 Authorize 失败，尝试 ele 兜底")
+            try:
+                ele = page.ele(
+                    "xpath://button[@name='authorize' and @value='1']",
+                    timeout=5,
+                )
+                if ele:
+                    ele.click()
+                    print("[browser] ele.click() 点击 Authorize 成功")
+                    time.sleep(3)
+                    continue
+            except Exception as exc:
+                print(f"[browser] 兜底点击 Authorize 异常: {exc}")
+            screenshot(page, "10-no-authorize-btn")
+            raise RuntimeError("GitHub 授权页找不到 Authorize 按钮")
+
+        # 成功回到 vps8
         if "vps8.zz.cd" in url and "/login" not in url and "/github" not in url:
             print(f"[browser] OAuth 完成，当前 URL: {url}")
             time.sleep(2.5)
             return
+
+        # 卡在登录页超过 10 秒 → 重试 /github/login
+        if "vps8.zz.cd" in url and "/login" in url:
+            if stuck_at_login_since == 0:
+                stuck_at_login_since = time.time()
+            elif time.time() - stuck_at_login_since > 10:
+                print("[browser] 卡在登录页超过 10 秒，重新 GET /github/login")
+                page.get(VPS8_GITHUB_LOGIN_URL)
+                time.sleep(3)
+                stuck_at_login_since = 0
+                continue
+        else:
+            stuck_at_login_since = 0
 
         time.sleep(1)
 
