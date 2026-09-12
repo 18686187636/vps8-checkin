@@ -1,15 +1,12 @@
 """VPS8 (vps8.zz.cd) 签到主流程。
 
-登录：GitHub OAuth（注入 GitHub session → 静默登录 vps8）
-验证码：hCaptcha（由 NoneCap 扩展自动解决，Chrome for Testing 136 加载）
-
-环境变量：
-    VPS8_GITHUB_SESSION_B64 (必填) Base64 编码的 GitHub session cookies
-    NONECAP_EXT_PATH       (必填) NoneCap 扩展目录路径
-    VPS8_PROXY             (可选) HTTP 代理
-    CHROME_PATH            (必填) Chrome for Testing 可执行文件路径
-    TELEGRAM_BOT_TOKEN     (可选)
-    TELEGRAM_CHAT_ID       (可选)
+流程：
+    1. GitHub OAuth 静默登录 vps8
+    2. 进入签到页，先直接点一次签到（触发 hCaptcha 重新加载）
+    3. 刷新页面
+    4. 等 hCaptcha widget 渲染出来
+    5. NoneCap 扩展自动解决 hCaptcha
+    6. 点击签到按钮，确认成功
 """
 
 from __future__ import annotations
@@ -66,6 +63,19 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(m in text for m in markers)
 
 
+def _is_already_checked_in(page) -> bool:
+    page_text = _visible_page_text(page)
+    if "今日签到状态" in page_text and (
+        "已签到" in page_text and "未签到" not in page_text
+    ):
+        return True
+    if _contains_any(page_text, CHECKED_TEXT_MARKERS) and not _contains_any(
+        page_text, UNCHECKED_TEXT_MARKERS
+    ):
+        return True
+    return False
+
+
 def _click_checkin_action(page) -> bool:
     js = r"""
     const isVisible = (el) => {
@@ -113,9 +123,11 @@ def _confirm_checkin_success(page, timeout: int = 30) -> bool:
 
 
 def do_checkin(page, github_cookies: list[dict]) -> str:
+    # ===== 1. GitHub OAuth 登录 =====
     browser.inject_github_session(page, github_cookies)
-    browser.login_via_github(page, timeout=90)
+    browser.login_via_github(page, timeout=120)
 
+    # ===== 2. 进入签到页 =====
     print(f"[checkin] 访问签到页: {CHECKIN_URL}")
     page.get(CHECKIN_URL)
     time.sleep(3)
@@ -128,46 +140,81 @@ def do_checkin(page, github_cookies: list[dict]) -> str:
     browser.screenshot(page, "03-checkin-page")
 
     time.sleep(2)
-    page_text = _visible_page_text(page)
 
-    if "今日签到状态" in page_text and (
-        "已签到" in page_text and "未签到" not in page_text
-    ):
+    if _is_already_checked_in(page):
         print("[checkin] 今日已签到（服务端确认）")
         time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    if _contains_any(page_text, CHECKED_TEXT_MARKERS) and not _contains_any(
-        page_text, UNCHECKED_TEXT_MARKERS
-    ):
-        print("[checkin] 检测到已签到状态")
+    # ===== 3. 预操作：先直接点一次签到 =====
+    print("[checkin] 预操作：先直接点一次签到按钮（不等人机验证）")
+    if _click_checkin_action(page):
+        print("[checkin] 已发送第一次签到请求")
+    else:
+        print("[checkin] 第一次点击未找到按钮（忽略，继续刷新）")
+    time.sleep(3)
+    browser.screenshot(page, "03a-pre-click")
+
+    if _is_already_checked_in(page):
+        print("[checkin] 预操作后即签到成功")
+        time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
+        browser.screenshot(page, "05-success")
+        return "签到成功"
+
+    # ===== 4. 刷新页面 =====
+    print("[checkin] 刷新签到页")
+    page.refresh()
+    time.sleep(5)
+    browser.screenshot(page, "03b-after-refresh")
+
+    if "/login" in (page.url or ""):
+        raise LoginFailed(f"刷新后被踢回登录页（{page.url}）")
+
+    if _is_already_checked_in(page):
+        print("[checkin] 刷新后已显示已签到")
         time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    print("[checkin] 等待 NoneCap 扩展解决 hCaptcha...")
-    if not browser.wait_hcaptcha_solved(page, timeout=180):
-        browser.screenshot(page, "03c-hcaptcha-timeout")
-        raise CaptchaTimeout("hCaptcha 未在 180s 内解决")
+    # ===== 5. 等 hCaptcha widget 渲染 =====
+    print("[checkin] 等待 hCaptcha widget 渲染（最多 30 秒）...")
+    widget_ok = browser.wait_hcaptcha_widget(page, timeout=30)
+    if widget_ok:
+        print("[checkin] hCaptcha widget 已渲染")
+    else:
+        print("[checkin] ⚠️ 30 秒内未检测到 hCaptcha widget")
+    browser.screenshot(page, "03c-hcaptcha-widget")
 
-    print("[checkin] hCaptcha 已通过，点击签到按钮")
+    # ===== 6. NoneCap 解决 hCaptcha =====
+    if widget_ok:
+        print("[checkin] 等待 NoneCap 扩展解决 hCaptcha...")
+        if not browser.wait_hcaptcha_solved(page, timeout=180):
+            browser.screenshot(page, "03d-hcaptcha-timeout")
+            raise CaptchaTimeout("NoneCap 未能在 180 秒内解决 hCaptcha")
+        browser.screenshot(page, "03e-hcaptcha-solved")
+    else:
+        print("[checkin] 没有 widget，跳过 hCaptcha 等待（直接尝试提交）")
+
+    # ===== 7. 点击签到按钮 =====
+    print("[checkin] 点击签到按钮")
     if not _click_checkin_action(page):
-        if _contains_any(_visible_page_text(page), CHECKED_TEXT_MARKERS):
+        if _is_already_checked_in(page):
             print("[checkin] 未找到按钮但已显示签到状态")
             browser.screenshot(page, "05-success")
             return "本日已签到"
-        browser.screenshot(page, "03b-no-button")
+        browser.screenshot(page, "03f-no-button")
         raise CheckinElementsNotFound("未找到签到按钮")
 
     print("[checkin] 已点击签到按钮")
     time.sleep(3)
     browser.screenshot(page, "04-after-click")
 
+    # ===== 8. 确认签到成功 =====
     if not _confirm_checkin_success(page, timeout=30):
-        print("[checkin] 第一次确认失败，等页面 reload...")
+        print("[checkin] 第一次确认失败，等页面 reload 后再试...")
         time.sleep(5)
-        if not _confirm_checkin_success(page, timeout=15):
+        if not _confirm_checkin_success(page, timeout=20):
             browser.screenshot(page, "04b-not-confirmed")
             raise CheckinNotConfirmed("点击签到后未确认到签到成功状态")
 
