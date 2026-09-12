@@ -122,6 +122,28 @@ return {
 
 
 # ---------------------------------------------------------------------------
+# cookies 读取兼容
+# ---------------------------------------------------------------------------
+
+def _all_cookies(page: ChromiumPage) -> list[dict]:
+    """兼容不同 DrissionPage 版本的 cookies() API。"""
+    try:
+        result = page.cookies(all_domains=True)
+        if result:
+            return result
+    except TypeError:
+        pass
+    except Exception as exc:
+        print(f"[browser] cookies(all_domains=True) 失败: {exc}")
+
+    try:
+        return page.cookies() or []
+    except Exception as exc:
+        print(f"[browser] cookies() 失败: {exc}")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # GitHub session 加载
 # ---------------------------------------------------------------------------
 
@@ -282,14 +304,11 @@ def create_page() -> ChromiumPage:
 # ---------------------------------------------------------------------------
 
 def _dump_github_cookies(page: ChromiumPage) -> None:
-    try:
-        actual = page.cookies(as_dict=False)
-        gh = [c for c in actual if "github.com" in str(c.get("domain") or "").lower()]
-        print(f"[browser] 浏览器中 GitHub cookies: {len(gh)} 条")
-        for c in gh:
-            print(f"[browser]   {c.get('name')} = {str(c.get('value'))[:12]}...")
-    except Exception as exc:
-        print(f"[browser] 读取 GitHub cookie 失败: {exc}")
+    actual = _all_cookies(page)
+    gh = [c for c in actual if "github.com" in str(c.get("domain") or "").lower()]
+    print(f"[browser] 浏览器中 GitHub cookies: {len(gh)} 条")
+    for c in gh:
+        print(f"[browser]   {c.get('name')} = {str(c.get('value'))[:12]}...")
 
 
 def inject_github_session(page: ChromiumPage, cookies: list[dict]) -> None:
@@ -315,7 +334,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
     page.get(VPS8_LOGIN_URL)
     time.sleep(2.5)
 
-    # 点 GitHub 按钮
     click_js = r"""
     const isVisible = (el) => {
       const s = window.getComputedStyle(el);
@@ -335,7 +353,7 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
     return true;
     """
     if not page.run_js(click_js):
-        browser_screenshot = screenshot(page, "10-no-github-button")
+        screenshot(page, "10-no-github-button")
         raise RuntimeError("找不到 GitHub 登录按钮")
 
     print("[browser] 已点击 GitHub 登录，等待跳转...")
@@ -354,7 +372,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
             print(f"[browser] URL: {url}")
             last_url = url
 
-        # 如果落在 GitHub 的 OAuth 授权页，点 Authorize
         if "github.com" in url and ("/login/oauth/authorize" in url or "/oauth/authorize" in url):
             if not authorize_clicked:
                 click_auth_js = r"""
@@ -370,7 +387,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
                     time.sleep(3)
                     continue
 
-        # 完成：回到 vps8 且不在 login
         if "vps8.zz.cd" in url and "/login" not in url and "/github" not in url:
             print(f"[browser] OAuth 完成，当前 URL: {url}")
             time.sleep(2.5)
