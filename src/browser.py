@@ -1,7 +1,7 @@
 """DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
 
-登录逻辑沿用旧版：同步 JS click 直接点击 GitHub 按钮和 Authorize 按钮，稳定可跑通。
-其余公开函数与新版 checkin.py 兼容。
+登录沿用旧版：同步 JS click 点 GitHub 按钮和 Authorize 按钮。
+优化：只有带 client_id 参数的授权页才点 Authorize；无参数版本等待自动跳转。
 """
 
 from __future__ import annotations
@@ -296,8 +296,63 @@ def is_logged_in(page: ChromiumPage) -> bool:
         return False
 
 
+GITHUB_BTN_JS = r"""
+const isVisible = (el) => {
+  const s = window.getComputedStyle(el);
+  const r = el.getBoundingClientRect();
+  return s.display !== 'none' && s.visibility !== 'hidden'
+    && r.width > 0 && r.height > 0;
+};
+const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+const target = candidates.find((el) => {
+  if (!isVisible(el)) return false;
+  const href = (el.getAttribute('href') || '').toLowerCase();
+  const text = (el.innerText || el.textContent || '').toLowerCase();
+  return href.includes('/github/login') || text.includes('github');
+});
+if (!target) return false;
+target.scrollIntoView({block: 'center', inline: 'center'});
+target.click();
+return true;
+"""
+
+AUTHORIZE_BTN_JS = r"""
+const btn = document.querySelector('button[name="authorize"]')
+  || Array.from(document.querySelectorAll('button')).find(b =>
+       (b.innerText || '').toLowerCase().includes('authorize'));
+if (btn) { btn.click(); return true; }
+return false;
+"""
+
+
+def _try_click_github_login(page: ChromiumPage) -> bool:
+    """访问 vps8 登录页并点击 GitHub 按钮。"""
+    page.get(VPS8_LOGIN_URL)
+    time.sleep(3)
+    for i in range(3):
+        try:
+            if page.run_js(GITHUB_BTN_JS):
+                print("[browser] 已点击 GitHub 登录按钮")
+                return True
+        except Exception as exc:
+            print(f"[browser] 点击 GitHub 按钮异常: {exc}")
+        print(f"[browser] 第 {i+1} 次未找到 GitHub 按钮")
+        time.sleep(2)
+
+    # 兜底
+    try:
+        ele = page.ele("xpath://a[contains(@href, '/github/login')]", timeout=5)
+        if ele:
+            ele.click()
+            print("[browser] ele.click() 兜底点击 GitHub 按钮成功")
+            return True
+    except Exception as exc:
+        print(f"[browser] ele 兜底异常: {exc}")
+    return False
+
+
 def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
-    # ---- 1. 先检查是否已经登录 ----
+    # ---- 1. 检查登录态 ----
     print("[browser] 先检查 vps8 登录态...")
     if is_logged_in(page):
         print("[browser] ✅ 已经登录 vps8，无需 OAuth")
@@ -305,68 +360,19 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
     print("[browser] 未登录，走 GitHub OAuth 流程")
 
-    # ---- 2. 打开登录页 ----
-    print(f"[browser] 打开 vps8 登录页: {VPS8_LOGIN_URL}")
-    page.get(VPS8_LOGIN_URL)
-    time.sleep(3)
-
-    if "vps8.zz.cd" in (page.url or "") and "/login" not in (page.url or ""):
-        print(f"[browser] 打开登录页后已被重定向到: {page.url}，视为已登录")
-        return
-
-    # ---- 3. 找 GitHub 按钮（同步 JS click，旧版方式）----
-    click_js = r"""
-    const isVisible = (el) => {
-      const s = window.getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return s.display !== 'none' && s.visibility !== 'hidden'
-        && r.width > 0 && r.height > 0;
-    };
-    const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-    const target = candidates.find((el) => {
-      if (!isVisible(el)) return false;
-      const href = (el.getAttribute('href') || '').toLowerCase();
-      const text = (el.innerText || el.textContent || '').toLowerCase();
-      return href.includes('/github/login') || text.includes('github');
-    });
-    if (!target) return false;
-    target.scrollIntoView({block: 'center', inline: 'center'});
-    target.click();
-    return true;
-    """
-
-    clicked = False
-    for i in range(3):
-        try:
-            if page.run_js(click_js):
-                clicked = True
-                break
-        except Exception as exc:
-            print(f"[browser] 第 {i+1} 次点击 GitHub 按钮异常: {exc}")
-        print(f"[browser] 第 {i+1} 次未找到 GitHub 按钮，等 3 秒")
-        time.sleep(3)
-
-    if not clicked:
-        # 兜底：DrissionPage ele
-        try:
-            ele = page.ele("xpath://a[contains(@href, '/github/login')]", timeout=5)
-            if ele:
-                ele.click()
-                clicked = True
-                print("[browser] ele.click() 兜底点击 GitHub 按钮成功")
-        except Exception as exc:
-            print(f"[browser] ele 兜底点击异常: {exc}")
-
-    if not clicked:
+    # ---- 2. 点 GitHub 按钮 ----
+    if not _try_click_github_login(page):
         screenshot(page, "10-no-github-button")
         raise RuntimeError("找不到 GitHub 登录按钮")
 
     print("[browser] 已点击 GitHub 登录，等待跳转...")
 
-    # ---- 4. 等待 OAuth 流程 ----
+    # ---- 3. 主循环 ----
     deadline = time.time() + timeout
     last_url = ""
-    authorize_clicked = False
+    authorize_clicked_for_url = ""
+    stuck_at_authorize_since = 0.0
+    stuck_at_login_since = 0.0
 
     while time.time() < deadline:
         try:
@@ -376,47 +382,11 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
         if url and url != last_url:
             print(f"[browser] URL: {url}")
             last_url = url
-            authorize_clicked = False  # URL 变了重置标记
 
         # access_denied → 直接报错
         if "access_denied" in url:
             screenshot(page, "10-access-denied")
             raise RuntimeError(f"GitHub 拒绝授权: {url}")
-
-        # GitHub 授权页 → 同步 JS click（旧版方式）
-        if "github.com" in url and ("/login/oauth/authorize" in url or "/oauth/authorize" in url):
-            if not authorize_clicked:
-                time.sleep(3)  # 等页面渲染完
-                click_auth_js = r"""
-                const btn = document.querySelector('button[name="authorize"]')
-                  || Array.from(document.querySelectorAll('button')).find(b =>
-                       (b.innerText || '').toLowerCase().includes('authorize'));
-                if (btn) { btn.click(); return true; }
-                return false;
-                """
-                try:
-                    if page.run_js(click_auth_js):
-                        print("[browser] 已点击 GitHub Authorize（同步 JS）")
-                        authorize_clicked = True
-                        time.sleep(4)
-                        continue
-                except Exception as exc:
-                    print(f"[browser] 同步 JS 点击 Authorize 异常: {exc}")
-
-                # 兜底：DrissionPage ele
-                try:
-                    ele = page.ele("xpath://button[@name='authorize']", timeout=3)
-                    if ele:
-                        ele.click()
-                        print("[browser] ele.click() 点击 Authorize")
-                        authorize_clicked = True
-                        time.sleep(4)
-                        continue
-                except Exception as exc:
-                    print(f"[browser] ele 点击 Authorize 异常: {exc}")
-
-                print("[browser] ⚠️ 本轮未点到 Authorize，5 秒后重试")
-                time.sleep(5)
 
         # 成功回到 vps8
         if "vps8.zz.cd" in url and "/login" not in url and "/github" not in url:
@@ -424,6 +394,70 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
             time.sleep(2.5)
             return
 
+        # GitHub 授权页
+        if "github.com" in url and "/oauth/authorize" in url:
+            if "client_id=" in url:
+                # 真正的授权页 → 点 Authorize（只点一次，同一个 URL 不重复点）
+                if authorize_clicked_for_url != url:
+                    time.sleep(3)
+                    try:
+                        if page.run_js(AUTHORIZE_BTN_JS):
+                            print("[browser] 已点击 GitHub Authorize（同步 JS）")
+                            authorize_clicked_for_url = url
+                            time.sleep(4)
+                            stuck_at_authorize_since = 0.0
+                            continue
+                    except Exception as exc:
+                        print(f"[browser] 点击 Authorize 异常: {exc}")
+
+                    # 兜底：ele.click()
+                    try:
+                        ele = page.ele("xpath://button[@name='authorize']", timeout=3)
+                        if ele:
+                            ele.click()
+                            print("[browser] ele.click() 点击 Authorize")
+                            authorize_clicked_for_url = url
+                            time.sleep(4)
+                            stuck_at_authorize_since = 0.0
+                            continue
+                    except Exception as exc:
+                        print(f"[browser] ele 点击 Authorize 异常: {exc}")
+
+                    print(f"[browser] 本轮未点到 Authorize，3 秒后重试")
+                    time.sleep(3)
+                else:
+                    time.sleep(1)
+                continue
+            else:
+                # 无参数版本 → 等待 GitHub 自动跳转（30 秒超时）
+                if stuck_at_authorize_since == 0:
+                    stuck_at_authorize_since = time.time()
+                    print(f"[browser] 授权页无参数（{url}），等待自动跳转")
+                elif time.time() - stuck_at_authorize_since > 30:
+                    print("[browser] 等待自动跳转超时 30s，重试整个 OAuth 流程")
+                    if not _try_click_github_login(page):
+                        raise RuntimeError("重试时找不到 GitHub 按钮")
+                    stuck_at_authorize_since = 0.0
+                    authorize_clicked_for_url = ""
+                    continue
+                time.sleep(1)
+                continue
+
+        # 卡在 vps8 登录页
+        if "vps8.zz.cd" in url and "/login" in url:
+            if stuck_at_login_since == 0:
+                stuck_at_login_since = time.time()
+            elif time.time() - stuck_at_login_since > 15:
+                print("[browser] 卡在 vps8 登录页超过 15s，重试")
+                if not _try_click_github_login(page):
+                    raise RuntimeError("重试时找不到 GitHub 按钮")
+                stuck_at_login_since = 0.0
+                authorize_clicked_for_url = ""
+                continue
+        else:
+            stuck_at_login_since = 0.0
+
+        # 其它 github.com 页面（如 /login/session）→ 等待
         time.sleep(1)
 
     screenshot(page, "10-oauth-timeout")
@@ -459,7 +493,6 @@ def _hcaptcha_response(page: ChromiumPage) -> str:
 
 
 def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
-    """等待 NoneCap 扩展自动解决 hCaptcha。"""
     if not has_hcaptcha_widget(page):
         print("[hcaptcha] 未检测到 hCaptcha widget")
         return False
