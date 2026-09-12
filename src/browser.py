@@ -1,20 +1,26 @@
-"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
+"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + reCAPTCHA 音频识别 + 截图。
 
-登录沿用旧版：同步 JS click 点 GitHub 按钮和 Authorize 按钮。
-hCaptcha 部分加了详细诊断 dump，便于定位 widget 未渲染的原因。
+验证码方案：
+1. 优先用音频挑战 + Google Speech 识别（免费）
+2. 失败回退 2captcha API（如果配置了 CAPTCHA_API_KEY）
 """
 
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import platform
+import random
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+import requests
 
 from DrissionPage import ChromiumOptions, ChromiumPage
 
@@ -24,7 +30,6 @@ SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 GITHUB_SESSION_ENV = "VPS8_GITHUB_SESSION_B64"
 PROXY_ENV = "VPS8_PROXY"
-NONECAP_EXT_ENV = "NONECAP_EXT_PATH"
 
 VPS8_BASE = "https://vps8.zz.cd"
 VPS8_LOGIN_URL = f"{VPS8_BASE}/login"
@@ -47,20 +52,6 @@ _SAMESITE_MAP = {
     "strict": "Strict",
     "": "Lax",
 }
-
-HAS_HCAPTCHA_JS = r"""
-return !!document.querySelector(
-  '.h-captcha, iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha-assets"]'
-);
-"""
-
-HCAPTCHA_RESPONSE_JS = r"""
-const ta = document.querySelector(
-  'textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]'
-);
-if (!ta) return '';
-return ta.value || '';
-"""
 
 GITHUB_BTN_JS = r"""
 const isVisible = (el) => {
@@ -246,19 +237,6 @@ def create_page() -> ChromiumPage:
             print(f"[browser] 设置代理失败: {exc}")
     else:
         print("[browser] 未配置代理，直连")
-
-    ext_path = os.environ.get(NONECAP_EXT_ENV, "").strip()
-    if ext_path and os.path.isdir(ext_path):
-        print(f"[browser] 加载 NoneCap 扩展: {ext_path}")
-        co.set_argument("--enable-extensions")
-        co.set_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
-        try:
-            co.add_extension(ext_path)
-            print("[browser] add_extension 调用完成")
-        except Exception as exc:
-            print(f"[browser] 加载扩展失败: {exc}")
-    else:
-        print("[browser] 未配置 NoneCap 扩展路径，跳过")
 
     co.auto_port()
 
@@ -472,129 +450,533 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
 
 # ---------------------------------------------------------------------------
-# hCaptcha 诊断
+# 验证码检测
 # ---------------------------------------------------------------------------
 
-def dump_hcaptcha_state(page: ChromiumPage, tag: str = "") -> None:
-    """打印页面 hCaptcha 相关的所有信息，用于排查 widget 未渲染的原因。"""
-    js = r"""
-    (() => {
-      const out = {
-        url: location.href,
-        title: document.title,
-        readyState: document.readyState,
-        bodyTextLen: (document.body && document.body.innerText || '').length,
-        container_count: document.querySelectorAll('.h-captcha').length,
-        container_outer: (() => {
-          const el = document.querySelector('.h-captcha');
-          return el ? (el.outerHTML || '').slice(0, 400) : '';
-        })(),
-        hcaptcha_scripts: Array.from(document.querySelectorAll('script')).filter(s =>
-          (s.src || '').toLowerCase().includes('hcaptcha')
-        ).map(s => s.src),
-        iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({
-          src: (f.src || '').slice(0, 120),
-          w: f.offsetWidth,
-          h: f.offsetHeight,
-        })),
-        has_window_hcaptcha: typeof window.hcaptcha !== 'undefined',
-        hcaptcha_response_value: (() => {
-          const ta = document.querySelector('textarea[name="h-captcha-response"]');
-          return ta ? (ta.value || '').slice(0, 40) : '';
-        })(),
-      };
-      return JSON.stringify(out);
-    })()
-    """
-    prefix = f"[hcaptcha-dump{(' ' + tag) if tag else ''}]"
+CAPTCHA_DETECT_JS = r"""
+(() => {
+  if (document.querySelector('.g-recaptcha, iframe[src*="recaptcha"]')) {
+    const el = document.querySelector('.g-recaptcha');
+    return JSON.stringify({
+      type: 'recaptcha',
+      sitekey: el ? (el.getAttribute('data-sitekey') || '') : '',
+    });
+  }
+  if (document.querySelector('.h-captcha, iframe[src*="hcaptcha"]')) {
+    const el = document.querySelector('.h-captcha');
+    return JSON.stringify({
+      type: 'hcaptcha',
+      sitekey: el ? (el.getAttribute('data-sitekey') || '') : '',
+    });
+  }
+  if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]')) {
+    const el = document.querySelector('.cf-turnstile, [data-sitekey]');
+    return JSON.stringify({
+      type: 'turnstile',
+      sitekey: el ? (el.getAttribute('data-sitekey') || '') : '',
+    });
+  }
+  return JSON.stringify({type: 'none', sitekey: ''});
+})()
+"""
+
+CAPTCHA_TOKEN_JS = r"""
+(() => {
+  const ta1 = document.querySelector('textarea[name="g-recaptcha-response"]');
+  if (ta1 && ta1.value) return ta1.value;
+  const ta2 = document.querySelector('textarea[name="h-captcha-response"]');
+  if (ta2 && ta2.value) return ta2.value;
+  const ta3 = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+  if (ta3 && ta3.value) return ta3.value;
+  return '';
+})()
+"""
+
+
+def detect_captcha(page: ChromiumPage) -> dict:
     try:
-        raw = page.run_js(js)
+        raw = page.run_js(CAPTCHA_DETECT_JS)
+        if raw:
+            return json.loads(raw) if isinstance(raw, str) else raw
     except Exception as exc:
-        print(f"{prefix} run_js 失败: {exc}")
-        return
-    if not raw:
-        print(f"{prefix} 无数据")
-        return
+        print(f"[captcha] 检测失败: {exc}")
+    return {"type": "none", "sitekey": ""}
+
+
+def get_captcha_token(page: ChromiumPage) -> str:
     try:
-        info = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception as exc:
-        print(f"{prefix} JSON 解析失败: {exc}, raw={raw!r}")
-        return
-    print(f"{prefix} URL: {info.get('url')}")
-    print(f"{prefix} title: {info.get('title')!r}")
-    print(f"{prefix} readyState: {info.get('readyState')}, bodyTextLen: {info.get('bodyTextLen')}")
-    print(f"{prefix} .h-captcha 数量: {info.get('container_count')}")
-    if info.get("container_outer"):
-        print(f"{prefix} .h-captcha outer: {info['container_outer']!r}")
-    print(f"{prefix} hcaptcha scripts: {info.get('hcaptcha_scripts')}")
-    print(f"{prefix} window.hcaptcha: {info.get('has_window_hcaptcha')}")
-    print(f"{prefix} h-captcha-response 值: {info.get('hcaptcha_response_value')!r}")
-    iframes = info.get("iframes", [])
-    print(f"{prefix} iframes ({len(iframes)}):")
-    for f in iframes:
-        print(f"{prefix}   src={f['src']!r} size={f['w']}x{f['h']}")
-
-
-# ---------------------------------------------------------------------------
-# hCaptcha
-# ---------------------------------------------------------------------------
-
-def has_hcaptcha_widget(page: ChromiumPage) -> bool:
-    try:
-        return bool(page.run_js(HAS_HCAPTCHA_JS))
-    except Exception:
-        return False
-
-
-def wait_hcaptcha_widget(page: ChromiumPage, timeout: int = 30) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if has_hcaptcha_widget(page):
-            return True
-        time.sleep(1)
-    return False
-
-
-def _hcaptcha_response(page: ChromiumPage) -> str:
-    try:
-        token = page.run_js(HCAPTCHA_RESPONSE_JS)
+        token = page.run_js(CAPTCHA_TOKEN_JS)
         return token or ""
     except Exception:
         return ""
 
 
-def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
-    if not has_hcaptcha_widget(page):
-        print("[hcaptcha] 未检测到 hCaptcha widget")
+def wait_captcha_widget(page: ChromiumPage, timeout: int = 60) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info = detect_captcha(page)
+        if info.get("type") != "none":
+            return info
+        time.sleep(2)
+    return {"type": "none", "sitekey": ""}
+
+
+# ---------------------------------------------------------------------------
+# reCAPTCHA 音频挑战求解
+# ---------------------------------------------------------------------------
+
+def _find_recaptcha_frame(page: ChromiumPage, keyword: str):
+    try:
+        for frame in page.get_frames():
+            try:
+                u = (frame.url or "").lower()
+            except Exception:
+                continue
+            if "recaptcha" in u and keyword in u:
+                return frame
+    except Exception as exc:
+        print(f"[recaptcha] 遍历 frame 失败: {exc}")
+    return None
+
+
+def _is_recaptcha_solved(page: ChromiumPage) -> bool:
+    # 方法 1：查 token
+    try:
+        for frame in page.get_frames():
+            try:
+                token = frame.run_js(r"""
+                (() => {
+                  try {
+                    const els = document.querySelectorAll(
+                      'textarea[name^="g-recaptcha-response"], textarea[name="g-recaptcha-response"]');
+                    for (const el of els) {
+                      if (el && el.value && el.value.length > 30) return el.value;
+                    }
+                    return '';
+                  } catch(e) { return ''; }
+                })()
+                """)
+                if token and len(token) > 30:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 方法 2：检查主页面上的 g-recaptcha-response
+    try:
+        token = get_captcha_token(page)
+        if token and len(token) > 30:
+            return True
+    except Exception:
+        pass
+
+    # 方法 3：查 anchor 的 aria-checked
+    anchor = _find_recaptcha_frame(page, "anchor")
+    if anchor:
+        try:
+            checked = anchor.run_js(r"""
+                (() => {
+                  try {
+                    const el = document.querySelector('#recaptcha-anchor');
+                    return el ? (el.getAttribute('aria-checked') === 'true') : false;
+                  } catch(e) { return false; }
+                })()
+            """)
+            if checked:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _click_recaptcha_checkbox(page: ChromiumPage) -> bool:
+    # 等 anchor iframe
+    for _ in range(60):
+        anchor = _find_recaptcha_frame(page, "anchor")
+        if anchor:
+            break
+        time.sleep(1)
+    else:
+        print("[recaptcha] 未找到 anchor iframe")
         return False
 
-    print("[hcaptcha] 检测到 hCaptcha widget，等待 NoneCap 扩展自动解决...")
-
-    if _hcaptcha_response(page):
-        print("[hcaptcha] 已存在 response token")
+    try:
+        checkbox = anchor.ele("#recaptcha-anchor", timeout=5)
+        if not checkbox:
+            print("[recaptcha] 未找到 checkbox 元素")
+            return False
+        try:
+            checkbox.click()
+        except Exception:
+            try:
+                checkbox.click(by_js=True)
+            except Exception as exc:
+                print(f"[recaptcha] checkbox.click 失败: {exc}")
+                return False
+        time.sleep(3)
         return True
+    except Exception as exc:
+        print(f"[recaptcha] 点击复选框失败: {exc}")
+        return False
+
+
+def _switch_to_audio(page: ChromiumPage) -> bool:
+    bframe = _find_recaptcha_frame(page, "bframe")
+    if not bframe:
+        return False
+
+    # 已经在音频模式？
+    try:
+        input_box = bframe.ele("#audio-response", timeout=1)
+        if input_box and input_box.states.is_displayed:
+            return True
+    except Exception:
+        pass
+
+    for _ in range(3):
+        try:
+            audio_btn = bframe.ele("#recaptcha-audio-button", timeout=3)
+            if audio_btn:
+                try:
+                    audio_btn.click()
+                except Exception:
+                    audio_btn.click(by_js=True)
+                time.sleep(3)
+                input_box = bframe.ele("#audio-response", timeout=2)
+                if input_box and input_box.states.is_displayed:
+                    return True
+        except Exception:
+            pass
+
+    # JS 兜底
+    try:
+        bframe.run_js(r"""
+            (() => {
+              const btn = document.querySelector('#recaptcha-audio-button');
+              if (btn) btn.click();
+            })()
+        """)
+        time.sleep(3)
+        input_box = bframe.ele("#audio-response", timeout=2)
+        if input_box and input_box.states.is_displayed:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _get_recaptcha_audio_url(page: ChromiumPage) -> str:
+    bframe = _find_recaptcha_frame(page, "bframe")
+    if not bframe:
+        return ""
+    for _ in range(10):
+        for sel in (
+            ".rc-audiochallenge-tdownload-link",
+            ".rc-audiochallenge-ndownload-link",
+            "#audio-source",
+        ):
+            try:
+                el = bframe.ele(sel, timeout=1)
+                if el:
+                    attr = "src" if "audio-source" in sel else "href"
+                    url = el.attr(attr)
+                    if url and len(url) > 10:
+                        return html.unescape(url)
+            except Exception:
+                pass
+        time.sleep(1)
+    return ""
+
+
+def _download_recaptcha_audio(url: str) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0",
+        "Referer": "https://www.google.com/",
+    }
+    urls = [url]
+    if "recaptcha.net" in url:
+        urls.append(url.replace("recaptcha.net", "www.google.com"))
+    elif "www.google.com" in url:
+        urls.append(url.replace("www.google.com", "recaptcha.net"))
+
+    for u in urls:
+        try:
+            r = requests.get(u, headers=headers, timeout=30)
+            r.raise_for_status()
+            if len(r.content) < 1000:
+                continue
+            path = tempfile.mktemp(suffix=".mp3")
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return path
+        except Exception as exc:
+            print(f"[recaptcha] 下载 {u[:60]} 失败: {exc}")
+            continue
+    return None
+
+
+def _recognize_recaptcha_audio(mp3_path: str) -> str:
+    try:
+        import speech_recognition as sr
+        from pydub import AudioSegment
+    except ImportError as exc:
+        print(f"[recaptcha] 缺少依赖: {exc}")
+        return ""
+
+    try:
+        wav_path = mp3_path.replace(".mp3", ".wav")
+        AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data, language="en-US")
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+        if text:
+            print(f"[recaptcha] 识别结果: {text!r}")
+            return text
+    except Exception as exc:
+        print(f"[recaptcha] 识别失败: {exc}")
+    return ""
+
+
+def _fill_recaptcha_audio(page: ChromiumPage, text: str) -> bool:
+    bframe = _find_recaptcha_frame(page, "bframe")
+    if not bframe:
+        return False
+    try:
+        input_box = bframe.ele("#audio-response", timeout=2)
+        if not input_box:
+            return False
+        try:
+            input_box.click()
+        except Exception:
+            pass
+        input_box.clear()
+        input_box.input(text)
+    except Exception as exc:
+        print(f"[recaptcha] 填写答案失败: {exc}")
+        return False
+
+    time.sleep(random.uniform(0.5, 1.5))
+    try:
+        verify_btn = bframe.ele("#recaptcha-verify-button", timeout=2)
+        if verify_btn:
+            try:
+                verify_btn.click()
+            except Exception:
+                verify_btn.click(by_js=True)
+    except Exception:
+        pass
+    return True
+
+
+def solve_recaptcha_via_audio(page: ChromiumPage, timeout: int = 90) -> bool:
+    """用音频挑战解决 Google reCAPTCHA v2。"""
+    print("[recaptcha] 开始音频挑战求解...")
+    start = time.time()
+
+    wait_deadline = time.time() + 30
+    while time.time() < wait_deadline:
+        if _find_recaptcha_frame(page, "anchor"):
+            break
+        time.sleep(2)
+
+    while time.time() - start < timeout:
+        if _is_recaptcha_solved(page):
+            print("[recaptcha] ✅ 已通过")
+            return True
+
+        try:
+            _click_recaptcha_checkbox(page)
+        except Exception as exc:
+            print(f"[recaptcha] 点击复选框失败: {exc}")
+            time.sleep(2)
+            continue
+
+        time.sleep(2)
+        if _is_recaptcha_solved(page):
+            print("[recaptcha] ✅ 点击后直接通过")
+            return True
+
+        if not _switch_to_audio(page):
+            time.sleep(2)
+            if not _switch_to_audio(page):
+                print("[recaptcha] 无法切换到音频模式")
+                time.sleep(random.uniform(2, 4))
+                continue
+
+        time.sleep(random.uniform(2, 4))
+        audio_url = _get_recaptcha_audio_url(page)
+        if not audio_url:
+            print("[recaptcha] 未找到音频 URL")
+            time.sleep(random.uniform(3, 6))
+            continue
+
+        print(f"[recaptcha] 音频 URL: {audio_url[:80]}...")
+        mp3_path = _download_recaptcha_audio(audio_url)
+        if not mp3_path:
+            print("[recaptcha] 音频下载失败")
+            time.sleep(random.uniform(3, 6))
+            continue
+
+        text = _recognize_recaptcha_audio(mp3_path)
+        try:
+            os.remove(mp3_path)
+        except Exception:
+            pass
+
+        if not text:
+            print("[recaptcha] 识别失败，重试")
+            time.sleep(random.uniform(3, 6))
+            continue
+
+        print(f"[recaptcha] 填入答案: {text}")
+        _fill_recaptcha_audio(page, text)
+        time.sleep(5)
+
+        if _is_recaptcha_solved(page):
+            print("[recaptcha] ✅ 音频验证通过")
+            return True
+        print("[recaptcha] 验证未通过，重试")
+
+    print(f"[recaptcha] ❌ {timeout}s 超时")
+    screenshot(page, "03c-recaptcha-timeout")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 2captcha 兜底（支持 recaptcha / hcaptcha / turnstile）
+# ---------------------------------------------------------------------------
+
+def solve_captcha_via_2captcha(
+    page: ChromiumPage,
+    api_key: str,
+    captcha_info: dict,
+    timeout: int = 240,
+) -> Optional[str]:
+    ctype = captcha_info.get("type", "none")
+    sitekey = captcha_info.get("sitekey", "")
+
+    if ctype == "none" or not sitekey:
+        print(f"[2captcha] 无效的验证码信息: {captcha_info}")
+        return None
+
+    existing = get_captcha_token(page)
+    if existing:
+        print(f"[2captcha] 页面已有 token（{len(existing)} 字符），无需调用 API")
+        return existing
+
+    page_url = page.url
+    print(f"[2captcha] 类型={ctype}, sitekey={sitekey[:16]}..., pageurl={page_url}")
+
+    if ctype == "recaptcha":
+        data = {"key": api_key, "method": "userrecaptcha",
+                "googlekey": sitekey, "pageurl": page_url, "json": 1}
+    elif ctype == "hcaptcha":
+        data = {"key": api_key, "method": "hcaptcha",
+                "sitekey": sitekey, "pageurl": page_url, "json": 1}
+    elif ctype == "turnstile":
+        data = {"key": api_key, "method": "turnstile",
+                "sitekey": sitekey, "pageurl": page_url, "json": 1}
+    else:
+        print(f"[2captcha] 不支持的类型: {ctype}")
+        return None
+
+    try:
+        r = requests.post("https://2captcha.com/in.php", data=data, timeout=30).json()
+    except Exception as exc:
+        print(f"[2captcha] 提交异常: {exc}")
+        return None
+
+    if r.get("status") != 1:
+        print(f"[2captcha] 提交失败: {r}")
+        return None
+
+    task_id = r["request"]
+    print(f"[2captcha] 任务已提交，task_id={task_id}")
 
     deadline = time.time() + timeout
     last_report = 0
-
     while time.time() < deadline:
-        if _hcaptcha_response(page):
-            elapsed = int(timeout - (deadline - time.time()))
-            print(f"[hcaptcha] ✅ NoneCap 已解决（耗时约 {elapsed}s）")
-            time.sleep(1)
-            return True
+        time.sleep(5)
+        try:
+            r = requests.get(
+                "https://2captcha.com/res.php",
+                params={"key": api_key, "action": "get", "id": task_id, "json": 1},
+                timeout=30,
+            ).json()
+        except Exception as exc:
+            print(f"[2captcha] 轮询异常: {exc}")
+            continue
 
-        now = time.time()
-        if now - last_report >= 15:
-            remaining = int(deadline - now)
-            print(f"[hcaptcha] 仍在等待... 剩余 {remaining}s")
-            last_report = now
+        if r.get("status") == 1:
+            token = r["request"]
+            print(f"[2captcha] ✅ 已解决（token 长度 {len(token)}）")
+            return token
+        if r.get("request") == "CAPCHA_NOT_READY":
+            now = time.time()
+            if now - last_report >= 20:
+                print(f"[2captcha] 等待中... 剩余 {int(deadline - now)}s")
+                last_report = now
+            continue
+        print(f"[2captcha] 错误: {r}")
+        return None
 
-        time.sleep(1)
+    print(f"[2captcha] ❌ {timeout}s 超时")
+    return None
 
-    print(f"[hcaptcha] ❌ {timeout}s 内未解决")
-    screenshot(page, "03c-hcaptcha-timeout")
-    return False
+
+CAPTCHA_INJECT_JS = r"""
+(() => {
+  const token = __TOKEN__;
+  const setValue = (el) => {
+    if (!el) return false;
+    el.value = token;
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    return true;
+  };
+
+  let count = 0;
+
+  const ta1 = document.querySelector('textarea[name="g-recaptcha-response"]');
+  if (ta1) { setValue(ta1); count++; }
+  else {
+    const form = document.getElementById('points-signin-form') || document.querySelector('form');
+    if (form) {
+      const hidden = document.createElement('textarea');
+      hidden.name = 'g-recaptcha-response';
+      hidden.style.display = 'none';
+      hidden.value = token;
+      form.appendChild(hidden);
+      count++;
+    }
+  }
+
+  const ta2 = document.querySelector('textarea[name="h-captcha-response"]');
+  if (ta2) { setValue(ta2); count++; }
+
+  const ta3 = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+  if (ta3) { setValue(ta3); count++; }
+
+  return count;
+})()
+"""
+
+
+def inject_captcha_token(page: ChromiumPage, token: str) -> bool:
+    js = CAPTCHA_INJECT_JS.replace("__TOKEN__", json.dumps(token))
+    try:
+        count = page.run_js(js)
+        print(f"[captcha] token 已注入到 {count} 个字段")
+        return bool(count)
+    except Exception as exc:
+        print(f"[captcha] 注入失败: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
