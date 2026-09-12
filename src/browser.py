@@ -75,8 +75,6 @@ return Array.from(document.querySelectorAll('iframe')).some((frame) => {
 });
 """
 
-# 找 Turnstile widget 可点击的元素：优先用 widget 内部的 iframe（位置最准），
-# 退到 .cf-turnstile / [data-sitekey] 容器（可能被父布局拉伸）。
 LOCATE_TURNSTILE_WIDGET_JS = r"""
 const isVisible = (el) => {
   if (!el) return false;
@@ -135,9 +133,6 @@ return {
 # ---------------------------------------------------------------------------
 
 def _normalize_cookies(raw: list[dict]) -> list[dict]:
-    """把浏览器扩展导出 / Playwright storage_state 的 cookie 数组
-    归一化为 DrissionPage page.set.cookies() 接受的格式。
-    """
     out: list[dict] = []
     for c in raw:
         if not isinstance(c, dict):
@@ -148,7 +143,6 @@ def _normalize_cookies(raw: list[dict]) -> list[dict]:
         if not (name and value and domain):
             continue
 
-        # DrissionPage 不认 domain 前导的点
         domain = str(domain).lstrip(".")
 
         item = {
@@ -186,12 +180,6 @@ def _normalize_cookies(raw: list[dict]) -> list[dict]:
 
 
 def load_cookies_from_env() -> list[dict]:
-    """从 VPS8_STORAGE_STATE_B64 读取并解码 cookies。
-
-    兼容两种输入：
-    - 浏览器扩展（Cookie-Editor）导出的 JSON 数组
-    - Playwright storage_state（{"cookies": [...], "origins": [...]}）
-    """
     raw = os.environ.get(STORAGE_STATE_ENV, "").strip()
     if not raw:
         raise RuntimeError(f"环境变量 {STORAGE_STATE_ENV} 未设置")
@@ -321,37 +309,41 @@ def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
 
     if cookies:
         _inject_cookies(page, cookies)
+    else:
+        print("[browser] 未提供 cookies，跳过注入")
 
     return page
 
 
 def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
-    """注入 cookies。
+    """先 set 再 get：避免浏览器先访问目标域时被服务端下发匿名 session 覆盖。"""
+    print(f"[browser] 准备注入 {len(cookies)} 条 cookies")
 
-    DrissionPage 的 set.cookies 需要在目标域下调用才稳妥，
-    所以先访问一次目标站点，再写入 cookie，最后重载 dashboard 校验。
-    """
-    print(f"[browser] 准备注入 {len(cookies)} 条 cookies，先访问 {TARGET_ORIGIN}")
+    # 在 about:blank 上直接 set cookies（DrissionPage 支持带 domain/path）
     try:
-        page.get(TARGET_ORIGIN)
-        time.sleep(1.0)
-    except Exception as exc:
-        print(f"[browser] 访问目标域失败: {exc}")
-
-    try:
+        page.set.cookies(cookies, set_domain=True)
+    except TypeError:
+        # 老版本 DrissionPage 没有 set_domain 参数
         page.set.cookies(cookies)
-        print("[browser] cookies 注入完成")
-    except Exception as exc:
-        print(f"[browser] cookies 注入失败: {exc}")
-        raise
 
-    # 重新加载一次，让服务器看到 cookie
+    # 打印注入后浏览器实际持有的 cookie
+    try:
+        actual = page.cookies(as_dict=False)
+        print(f"[browser] 注入后浏览器实际 cookie 数量: {len(actual)}")
+        for c in actual:
+            name = c.get("name")
+            val = str(c.get("value", ""))
+            print(f"[browser]   actual: {name}={val[:12]}...")
+    except Exception as exc:
+        print(f"[browser] 读取注入结果失败: {exc}")
+
+    # 再访问目标页
     try:
         page.get(TARGET_ORIGIN + "/dashboard")
         time.sleep(1.5)
-        print(f"[browser] cookie 生效校验，当前 URL: {page.url}")
+        print(f"[browser] 访问 dashboard 后 URL: {page.url}")
     except Exception as exc:
-        print(f"[browser] 校验 cookie 时访问 dashboard 失败: {exc}")
+        print(f"[browser] 访问 dashboard 失败: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +382,6 @@ def screenshot(page: ChromiumPage, name: str, full_page: bool = False) -> Option
 # ---------------------------------------------------------------------------
 
 def wait_turnstile_iframe(page: ChromiumPage, timeout: int = 30) -> bool:
-    """等待 Cloudflare Turnstile iframe 加载出来。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _has_turnstile_iframe(page):
@@ -400,7 +391,6 @@ def wait_turnstile_iframe(page: ChromiumPage, timeout: int = 30) -> bool:
 
 
 def _has_turnstile_widget(page: ChromiumPage) -> bool:
-    """检测页面是否有 Turnstile widget（容器、sitekey 或 iframe）。"""
     try:
         return bool(page.run_js("return !!document.querySelector('.cf-turnstile, [data-sitekey]');")) \
             or bool(page.run_js(HAS_TURNSTILE_IFRAME_JS))
@@ -409,7 +399,6 @@ def _has_turnstile_widget(page: ChromiumPage) -> bool:
 
 
 def wait_turnstile_widget(page: ChromiumPage, timeout: int = 30) -> bool:
-    """等待 Turnstile widget 出现（容器或 iframe 任一即可）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _has_turnstile_widget(page):
@@ -418,7 +407,6 @@ def wait_turnstile_widget(page: ChromiumPage, timeout: int = 30) -> bool:
     return False
 
 
-# 向后兼容旧名字
 wait_turnstile_iframe = wait_turnstile_widget
 
 
@@ -428,11 +416,6 @@ def solve_turnstile(
     poll_interval: float = 1.5,
     require_iframe: bool = True,
 ) -> bool:
-    """处理 Cloudflare Turnstile 复选框验证。
-
-    策略：等 widget 容器出现 → 根据容器视口位置点击复选框区域 →
-    检查 cf-turnstile-response token 是否生成。
-    """
     if require_iframe and not wait_turnstile_widget(page, timeout=min(timeout, 20)):
         print("[turnstile] 未检测到 Turnstile widget（页面可能没有盾）")
         return False
@@ -470,7 +453,6 @@ def solve_turnstile(
             print(f"[turnstile] 第 {attempts} 次尝试未能点击")
 
         if _wait_for_pass(page, timeout=8):
-            # token 出现后再等一会儿，给前端回调留时间
             time.sleep(1.5)
             print(f"[turnstile] 盾通过 (尝试 {attempts} 次)")
             return True
@@ -482,10 +464,6 @@ def solve_turnstile(
 
 
 def _click_turnstile_checkbox(page: ChromiumPage) -> bool:
-    """根据 widget 容器的视口位置，用 CDP 鼠标事件点击复选框区域。
-
-    Turnstile widget 复选框始终在容器左侧约 28px 处、垂直居中。
-    """
     try:
         info = page.run_js(LOCATE_TURNSTILE_WIDGET_JS)
     except Exception as exc:
@@ -502,7 +480,6 @@ def _click_turnstile_checkbox(page: ChromiumPage) -> bool:
         print(f"[turnstile] widget 尺寸异常: {width}x{height}")
         return False
 
-    # 先把容器滚动到视口内，避免 y 是负数或超过窗口
     try:
         page.run_js(
             "const t = document.querySelector('.cf-turnstile, [data-sitekey]'); "
@@ -648,7 +625,6 @@ def _try_click_checkbox_by_viewport(page: ChromiumPage) -> bool:
 
 
 def _turnstile_token(page: ChromiumPage) -> str:
-    """读取 Cloudflare Turnstile 验证通过后的 response token。"""
     try:
         token = page.run_js(
             r"""
@@ -667,11 +643,6 @@ def _turnstile_token(page: ChromiumPage) -> str:
 
 
 def _wait_for_pass(page: ChromiumPage, timeout: int = 20) -> bool:
-    """点击复选框后等盾通过。
-
-    通过信号只看 cf-turnstile-response token —— iframe 在 widget 重渲染
-    过程中可能短暂消失，不能作为通过依据。
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _turnstile_token(page):
