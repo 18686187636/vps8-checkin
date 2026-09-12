@@ -1,22 +1,13 @@
-# 虚拟环境
 .venv/
-venv/
-env/
-
-# Python 缓存
 __pycache__/
-*.py[cod]
-*.egg-info/
+*.pyc
 
-# 本地环境配置
 .env
 .env.local
+cookies.json
+cookies.b64
+storage_state.json
+storage_state.b64
 
-# 截图（运行时产物）
-screenshots/*.png
-
-# 缓存
-.checkin-cache/
-
-# 系统
-.DS_Store
+screenshots/
+.checkin_state/
