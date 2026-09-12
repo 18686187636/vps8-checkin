@@ -1,16 +1,17 @@
-"""VPS8 (vps8.zz.cd) 签到主流程（cookie 登录态方案）。
+"""VPS8 (vps8.zz.cd) 签到主流程（GitHub OAuth 自动登录方案）。
 
 环境变量：
-    VPS8_STORAGE_STATE_B64 (必填) Base64 编码的登录态 cookies
-    TELEGRAM_BOT_TOKEN     (可选)
-    TELEGRAM_CHAT_ID       (可选)
-    GITHUB_RUN_URL         (可选，由 workflow 注入)
-    VPS8_USER_AGENT        (可选)
+    VPS8_GITHUB_SESSION_B64 (必填) Base64 编码的 GitHub session cookies
+    VPS8_PROXY              (可选) HTTP 代理地址
+    TELEGRAM_BOT_TOKEN      (可选)
+    TELEGRAM_CHAT_ID        (可选)
+    GITHUB_RUN_URL          (可选)
+    VPS8_USER_AGENT         (可选)
 
 退出码：
-    0 - 签到成功，或本日已签到，或本地状态显示今日已签到
+    0 - 签到成功，或本日已签到
     1 - 重试 3 次后仍失败
-    2 - 配置错误（VPS8_STORAGE_STATE_B64 缺失或解码失败）
+    2 - 配置错误
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from . import browser, notifier, state
 from .env import load_local_env
 
 BASE_URL = "https://vps8.zz.cd"
-LOGIN_URL = f"{BASE_URL}/login"
 DASHBOARD_URL = f"{BASE_URL}/dashboard"
 CHECKIN_URL = f"{BASE_URL}/points/signin"
 
@@ -31,35 +31,28 @@ RETRY_INTERVAL_SECONDS = 30
 SUCCESS_SNAPSHOT_DELAY_SECONDS = 3
 
 CHECKED_TEXT_MARKERS = (
-    "今日已签到",
-    "今天已签到",
-    "签到成功",
-    "已签到",
-    "明天再来",
-    "已经签到",
+    "今日已签到", "今天已签到", "签到成功",
+    "已签到", "明天再来", "已经签到",
 )
 UNCHECKED_TEXT_MARKERS = (
-    "立即签到",
-    "点击签到",
-    "今日签到",
-    "签到领取",
+    "立即签到", "点击签到", "今日签到", "签到领取",
 )
 
 
 class LoginFailed(Exception):
-    """登录态无效，被踢回登录页。"""
+    pass
 
 
 class CheckinElementsNotFound(Exception):
-    """页面上找不到关键元素（按钮/输入框等）。"""
+    pass
 
 
 class TurnstileTimeout(Exception):
-    """Turnstile 验证超时未通过。"""
+    pass
 
 
 class CheckinNotConfirmed(Exception):
-    """点击签到后未观察到「签到成功」状态。"""
+    pass
 
 
 def _visible_page_text(page) -> str:
@@ -67,89 +60,21 @@ def _visible_page_text(page) -> str:
         text = page.run_js("return document.body ? document.body.innerText : '';")
         return (text or "").replace("\u00a0", " ")
     except Exception as exc:
-        print(f"[checkin] 获取页面可见文本失败: {exc}")
+        print(f"[checkin] 获取页面文本失败: {exc}")
         return ""
 
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
-    return any(marker in text for marker in markers)
-
-
-def _dump_cookies(page) -> None:
-    try:
-        actual = page.cookies(as_dict=False)
-    except Exception as exc:
-        print(f"[checkin] 读取浏览器 cookie 失败: {exc}")
-        return
-
-    print(f"[checkin] 浏览器当前 cookie 数量: {len(actual)}")
-    for c in actual:
-        name = c.get("name")
-        val = str(c.get("value", ""))
-        domain = c.get("domain", "")
-        print(f"[checkin]   cookie: {name}={val[:12]}... (domain={domain})")
-
-
-def _verify_session(page) -> None:
-    """直接访问 dashboard 和签到页。
-
-    重要：不要访问 /（首页），否则 FOSSBilling 会重置会话，
-    把我们的 PHPSESSID 覆盖掉。
-    """
-
-    # ---- 第 1 步：直接访问 dashboard ----
-    print(f"[checkin] [1/2] 访问 dashboard: {DASHBOARD_URL}")
-    try:
-        page.get(DASHBOARD_URL)
-        time.sleep(2.5)
-        print(f"[checkin] dashboard 后 URL: {page.url}")
-        _dump_cookies(page)
-    except Exception as exc:
-        print(f"[checkin] 访问 dashboard 异常: {exc}")
-
-    # 若 dashboard 被 JS 跳走，等一下再看
-    if "/dashboard" not in (page.url or ""):
-        time.sleep(2)
-        print(f"[checkin] 等待后 URL: {page.url}")
-
-    if "/login" in (page.url or ""):
-        browser.screenshot(page, "00-session-expired")
-        raise LoginFailed(
-            f"登录态已失效（当前 URL: {page.url}），"
-            "请重新导出 cookies 并更新 VPS8_STORAGE_STATE_B64"
-        )
-
-    # ---- 第 2 步：直接访问签到页 ----
-    print(f"[checkin] [2/2] 访问签到页: {CHECKIN_URL}")
-    try:
-        page.get(CHECKIN_URL)
-        time.sleep(2.5)
-        print(f"[checkin] 签到页 URL: {page.url}")
-        _dump_cookies(page)
-    except Exception as exc:
-        print(f"[checkin] 访问签到页异常: {exc}")
-
-    if "/login" in (page.url or ""):
-        browser.screenshot(page, "00-session-expired")
-        raise LoginFailed(
-            f"签到页被重定向到 login（{page.url}），"
-            "请重新导出 cookies 并更新 VPS8_STORAGE_STATE_B64"
-        )
-
-    print(f"[checkin] 登录态有效，当前 URL: {page.url}")
-    browser.screenshot(page, "02-after-login")
+    return any(m in text for m in markers)
 
 
 def _click_checkin_action(page) -> bool:
     js = r"""
     const isVisible = (el) => {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return style.display !== 'none'
-        && style.visibility !== 'hidden'
-        && rect.width > 0
-        && rect.height > 0
-        && !el.disabled;
+      const s = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return s.display !== 'none' && s.visibility !== 'hidden'
+        && r.width > 0 && r.height > 0 && !el.disabled;
     };
     const keywords = ['立即签到', '点击签到', '签到领取', '今日签到'];
     const candidates = Array.from(document.querySelectorAll(
@@ -183,17 +108,30 @@ def _confirm_checkin_success(page, timeout: int = 20) -> bool:
     return False
 
 
-def do_checkin(page) -> str:
-    _verify_session(page)
+def do_checkin(page, github_cookies: list[dict]) -> str:
+    # 注入 GitHub session，走 OAuth 登录 vps8
+    browser.inject_github_session(page, github_cookies)
+    browser.login_via_github(page, timeout=90)
 
-    # _verify_session 结束时已停在 /points/signin，等 SPA 渲染
+    # 现在应该已经在 vps8 里，直接去签到页
+    print(f"[checkin] 访问签到页: {CHECKIN_URL}")
+    page.get(CHECKIN_URL)
+    time.sleep(2.5)
+
+    if "/login" in (page.url or ""):
+        browser.screenshot(page, "00-session-expired")
+        raise LoginFailed(f"被踢回登录页（{page.url}）")
+
+    print(f"[checkin] 签到页 URL: {page.url}")
+    browser.screenshot(page, "03-checkin-page")
+
     time.sleep(2)
     page_text = _visible_page_text(page)
 
     if "今日签到状态" in page_text and (
         "已签到" in page_text and "未签到" not in page_text
     ):
-        print("[checkin] 今日签到状态显示已签到，无需操作")
+        print("[checkin] 今日已签到")
         time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
         browser.screenshot(page, "05-success")
         return "本日已签到"
@@ -201,34 +139,34 @@ def do_checkin(page) -> str:
     if _contains_any(page_text, CHECKED_TEXT_MARKERS) and not _contains_any(
         page_text, UNCHECKED_TEXT_MARKERS
     ):
-        print("[checkin] 检测到「已签到」状态，无需操作")
+        print("[checkin] 检测到已签到状态")
         time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    print("[checkin] 签到页：先处理 Cloudflare Turnstile")
+    print("[checkin] 处理 Cloudflare Turnstile")
     if not browser.solve_turnstile(page, timeout=60):
-        browser.screenshot(page, "03c-checkin-turnstile-fail")
-        raise TurnstileTimeout("签到页 Turnstile 未通过")
+        browser.screenshot(page, "03c-turnstile-fail")
+        raise TurnstileTimeout("Turnstile 未通过")
 
     time.sleep(1.5)
-    browser.screenshot(page, "03d-checkin-after-turnstile")
+    browser.screenshot(page, "03d-after-turnstile")
 
     if not _click_checkin_action(page):
         if _contains_any(_visible_page_text(page), CHECKED_TEXT_MARKERS):
-            print("[checkin] 未找到签到按钮但已显示签到状态")
+            print("[checkin] 未找到按钮但已签到")
             browser.screenshot(page, "05-success")
             return "本日已签到"
-        browser.screenshot(page, "03b-no-checkin-button")
-        raise CheckinElementsNotFound("签到页未找到签到按钮且未识别到已签到状态")
+        browser.screenshot(page, "03b-no-button")
+        raise CheckinElementsNotFound("未找到签到按钮")
 
     print("[checkin] 已点击签到按钮")
     time.sleep(2)
-    browser.screenshot(page, "04-after-click-checkin")
+    browser.screenshot(page, "04-after-click")
 
     if not _confirm_checkin_success(page, timeout=30):
-        browser.screenshot(page, "04b-checkin-not-confirmed")
-        raise CheckinNotConfirmed("点击签到后未确认到签到成功状态")
+        browser.screenshot(page, "04b-not-confirmed")
+        raise CheckinNotConfirmed("未确认签到成功")
 
     time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
     browser.screenshot(page, "05-success")
@@ -248,13 +186,13 @@ def main() -> int:
         print(f"[env] 已从本地 env 文件加载: {', '.join(loaded_env)}")
 
     if state.already_checked_in_today():
-        print("[main] 本地状态显示今日已签到，跳过本次运行")
+        print("[main] 今日已签到，跳过")
         return 0
 
     try:
-        cookies = browser.load_cookies_from_env()
+        github_cookies = browser.load_github_session_from_env()
     except Exception as exc:
-        print(f"[fatal] 加载登录态失败: {exc}")
+        print(f"[fatal] 加载 GitHub session 失败: {exc}")
         return 2
 
     browser.clean_screenshots()
@@ -264,14 +202,11 @@ def main() -> int:
         print(f"\n========== 尝试 {attempt}/{MAX_ATTEMPTS} ==========")
         page = None
         try:
-            page = browser.create_page(cookies=cookies)
-            # 双保险：即使 create_page 未接住，也显式再注入一次
-            browser.apply_cookies(page, cookies)
-
-            status = do_checkin(page)
+            page = browser.create_page()
+            status = do_checkin(page, github_cookies)
             state.mark_success()
             _send_result_snapshot(page, status, "06-result")
-            print("[main] 任务完成（已签到或本次签到成功）")
+            print("[main] 任务完成")
             return 0
         except Exception as exc:
             last_error = exc
