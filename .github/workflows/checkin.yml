@@ -1,106 +1,71 @@
 name: VPS8 Checkin
 
 on:
-  #schedule:
-    # 每天北京时间 08:30 运行（UTC 00:30）
-    #- cron: '30 0 * * *'
+  schedule:
+    # 每 8 小时一次（北京时间 9:23 / 17:23 / 1:23）
+    - cron: "23 1,9,17 * * *"
   workflow_dispatch:
-    inputs:
-      debug:
-        description: '开启更详细日志（仅手动触发时使用）'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
-
-concurrency:
-  group: checkin
-  cancel-in-progress: false
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Resolve checkin date
-        id: checkin-date
-        run: |
-          echo "date=$(TZ=Asia/Shanghai date +%F)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore daily success marker
-        id: daily-success
-        uses: actions/cache/restore@v4
+      - uses: actions/setup-python@v5
         with:
-          path: .checkin-cache/success
-          key: vps8-checkin-success-${{ steps.checkin-date.outputs.date }}
+          python-version: "3.12"
+          cache: pip
 
-      - name: Skip if already succeeded today
-        if: steps.daily-success.outputs.cache-hit == 'true'
-        run: |
-          echo "北京时间 ${{ steps.checkin-date.outputs.date }} 已有成功签到记录，跳过本次登录和签到。"
+      - name: Compute Beijing date
+        id: bjdate
+        run: echo "date=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Python
-        if: steps.daily-success.outputs.cache-hit != 'true'
-        uses: actions/setup-python@v5
+      - name: Restore checkin state
+        uses: actions/cache@v4
+        id: checkin-state
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          path: .checkin_state
+          key: vps8-checkin-state-${{ steps.bjdate.outputs.date }}
 
-      - name: Install system dependencies
-        if: steps.daily-success.outputs.cache-hit != 'true'
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Install Chrome
         run: |
+          python - <<'PY'
+          from DrissionPage import ChromiumOptions
+          ChromiumOptions().set_browser_path("chrome").save()
+          PY
           sudo apt-get update
-          sudo apt-get install -y xvfb fontconfig fonts-noto-cjk fonts-noto-color-emoji
-          sudo fc-cache -f -v
+          sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
 
-      - name: Install Python dependencies
-        if: steps.daily-success.outputs.cache-hit != 'true'
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Verify Chrome and font installation
-        if: steps.daily-success.outputs.cache-hit != 'true'
-        run: |
-          which google-chrome || which google-chrome-stable || true
-          google-chrome --version || google-chrome-stable --version || true
-          fc-match sans:lang=zh-cn
+      - name: Install Xvfb
+        run: sudo apt-get install -y xvfb
 
       - name: Run checkin
-        if: steps.daily-success.outputs.cache-hit != 'true'
         env:
-          VPS8_EMAIL: ${{ secrets.VPS8_EMAIL }}
-          VPS8_PASSWORD: ${{ secrets.VPS8_PASSWORD }}
+          VPS8_STORAGE_STATE_B64: ${{ secrets.VPS8_STORAGE_STATE_B64 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          PYTHONUNBUFFERED: '1'
-          LANG: C.UTF-8
-          LC_ALL: C.UTF-8
+        run: xvfb-run -a python -m src
+
+      - name: Show checkin state
+        if: always()
         run: |
-          xvfb-run -a --server-args="-screen 0 1280x800x24" python -m src.checkin
+          if [ -f .checkin_state/last_success.txt ]; then
+            echo "last_success = $(cat .checkin_state/last_success.txt)"
+          else
+            echo "no state file"
+          fi
 
-      - name: Write daily success marker
-        if: success() && steps.daily-success.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p .checkin-cache
-          printf 'success_at=%s\nrun=%s\n' "$(date -u +%FT%TZ)" "${{ github.run_id }}" > .checkin-cache/success
-
-      - name: Save daily success marker
-        if: success() && steps.daily-success.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .checkin-cache/success
-          key: vps8-checkin-success-${{ steps.checkin-date.outputs.date }}
-
-      - name: Upload screenshots on failure
-        if: failure() && steps.daily-success.outputs.cache-hit != 'true'
+      - name: Upload failure screenshots
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-${{ github.run_id }}
+          name: failure-screenshots
           path: screenshots/
-          retention-days: 7
           if-no-files-found: ignore
