@@ -5,6 +5,7 @@
 - 截图统一保存到项目根目录的 screenshots/ 下
 - Turnstile 处理实现多策略回退，提高过盾稳定性
 - 登录态通过 VPS8_STORAGE_STATE_B64 注入，不再走邮箱密码登录
+- cookie 注入后直接访问 /dashboard，不访问首页（首页会重置 session）
 """
 
 from __future__ import annotations
@@ -319,10 +320,7 @@ def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
 
 
 def apply_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
-    """显式注入 cookies，供 checkin.py 调用，避免参数传递丢失。
-
-    幂等：同一页面上重复调用也只是覆盖同名 cookie。
-    """
+    """显式注入 cookies，供 checkin.py 调用，避免参数传递丢失。"""
     if not cookies:
         print("[browser] apply_cookies 收到空 cookies，跳过")
         return
@@ -331,16 +329,17 @@ def apply_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
 
 
 def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
-    """先 set 再 get：避免浏览器先访问目标域时被服务端下发匿名 session 覆盖。"""
+    """先 set 再 get，直接访问 /dashboard，不访问首页。
+
+    重要：/（首页）会让 FOSSBilling 重置会话，把我们的 PHPSESSID 覆盖掉。
+    """
     print(f"[browser] 准备注入 {len(cookies)} 条 cookies")
 
-    # 先访问一次 about:blank 的等价物：DrissionPage 打开时默认就在 about:blank
-    # 在空白页上直接 set cookies（DrissionPage 支持带 domain/path）
+    # 关键：DrissionPage 打开时默认在 about:blank，可以直接 set cookies
     try:
         page.set.cookies(cookies, set_domain=True)
         print("[browser] set.cookies(..., set_domain=True) 调用完成")
     except TypeError:
-        # 老版本 DrissionPage 没有 set_domain 参数
         try:
             page.set.cookies(cookies)
             print("[browser] set.cookies(...) 调用完成（老版本 API）")
@@ -362,18 +361,14 @@ def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
     except Exception as exc:
         print(f"[browser] 读取注入结果失败: {exc}")
 
-    # 再访问目标页
+    # 关键：直接访问 /dashboard，绕过首页
     try:
         page.get(TARGET_ORIGIN + "/dashboard")
-        time.sleep(1.5)
+        time.sleep(2)
         print(f"[browser] 访问 dashboard 后 URL: {page.url}")
         try:
             actual_after = page.cookies(as_dict=False)
             print(f"[browser] 访问后浏览器 cookie 数量: {len(actual_after)}")
-            for c in actual_after:
-                name = c.get("name")
-                val = str(c.get("value", ""))
-                print(f"[browser]   after: {name}={val[:12]}...")
         except Exception as exc:
             print(f"[browser] 读取访问后 cookie 失败: {exc}")
     except Exception as exc:
