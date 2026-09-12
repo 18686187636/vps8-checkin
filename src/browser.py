@@ -5,6 +5,7 @@
 - 截图统一保存到项目根目录的 screenshots/ 下
 - Turnstile 处理实现多策略回退，提高过盾稳定性
 - 登录态通过 VPS8_STORAGE_STATE_B64 注入，不再走邮箱密码登录
+- 若设置了 VPS8_PROXY，浏览器走该代理（SOCKS5 或 HTTP）
 - cookie 注入后直接访问 /dashboard，不访问首页（首页会重置 session）
 """
 
@@ -28,6 +29,7 @@ SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 STORAGE_STATE_ENV = "VPS8_STORAGE_STATE_B64"
+PROXY_ENV = "VPS8_PROXY"
 TARGET_ORIGIN = "https://vps8.zz.cd"
 
 _CHROME_CANDIDATES = {
@@ -294,6 +296,17 @@ def create_page(cookies: Optional[list[dict]] = None) -> ChromiumPage:
     co.set_pref("credentials_enable_service", False)
     co.set_pref("profile.password_manager_enabled", False)
 
+    # ---- 代理配置 ----
+    proxy = os.environ.get(PROXY_ENV, "").strip()
+    if proxy:
+        print(f"[browser] 使用代理: {proxy}")
+        try:
+            co.set_proxy(proxy)
+        except Exception as exc:
+            print(f"[browser] 设置代理失败: {exc}")
+    else:
+        print("[browser] 未配置代理，直连")
+
     co.auto_port()
 
     chrome_path = _detect_chrome_path()
@@ -334,8 +347,9 @@ def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
     重要：/（首页）会让 FOSSBilling 重置会话，把我们的 PHPSESSID 覆盖掉。
     """
     print(f"[browser] 准备注入 {len(cookies)} 条 cookies")
+    for c in cookies:
+        print(f"[browser]   将要注入: {c['name']}={c['value'][:16]}...")
 
-    # 关键：DrissionPage 打开时默认在 about:blank，可以直接 set cookies
     try:
         page.set.cookies(cookies, set_domain=True)
         print("[browser] set.cookies(..., set_domain=True) 调用完成")
@@ -350,16 +364,25 @@ def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
         print(f"[browser] set.cookies 失败: {exc}")
         raise
 
-    # 打印注入后浏览器实际持有的 cookie
     try:
         actual = page.cookies(as_dict=False)
         print(f"[browser] 注入后浏览器实际 cookie 数量: {len(actual)}")
         for c in actual:
             name = c.get("name")
             val = str(c.get("value", ""))
-            print(f"[browser]   actual: {name}={val[:12]}...")
+            domain = c.get("domain", "")
+            print(f"[browser]   actual: {name}={val[:16]}... (domain={domain})")
     except Exception as exc:
         print(f"[browser] 读取注入结果失败: {exc}")
+
+    # 打印当前出口 IP
+    try:
+        page.get("https://api.ipify.org/?format=text")
+        time.sleep(1)
+        ip_text = (page.run_js("return document.body ? document.body.innerText : '';") or "").strip()
+        print(f"[browser] 当前出口 IP: {ip_text}")
+    except Exception as exc:
+        print(f"[browser] 获取出口 IP 失败: {exc}")
 
     # 关键：直接访问 /dashboard，绕过首页
     try:
@@ -367,8 +390,22 @@ def _inject_cookies(page: ChromiumPage, cookies: list[dict]) -> None:
         time.sleep(2)
         print(f"[browser] 访问 dashboard 后 URL: {page.url}")
         try:
+            resp = page.response
+            print(f"[browser] dashboard 响应状态: {resp.status if resp else 'N/A'}")
+        except Exception:
+            pass
+        try:
+            title = page.run_js("return document.title || '';")
+            print(f"[browser] dashboard 页面 title: {title!r}")
+        except Exception:
+            pass
+        try:
             actual_after = page.cookies(as_dict=False)
             print(f"[browser] 访问后浏览器 cookie 数量: {len(actual_after)}")
+            for c in actual_after:
+                name = c.get("name")
+                val = str(c.get("value", ""))
+                print(f"[browser]   after: {name}={val[:16]}...")
         except Exception as exc:
             print(f"[browser] 读取访问后 cookie 失败: {exc}")
     except Exception as exc:
