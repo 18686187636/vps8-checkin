@@ -31,14 +31,49 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Install Chrome
+      # ===== 安装 Chrome for Testing 136（保留 --load-extension） =====
+      - name: Install Chrome for Testing 136
         run: |
-          python - <<'PY'
-          from DrissionPage import ChromiumOptions
-          ChromiumOptions().set_browser_path("chrome").save()
-          PY
+          CFM_VERSION="136.0.7103.113"
+          URL="https://storage.googleapis.com/chrome-for-testing-public/${CFM_VERSION}/linux64/chrome-linux64.zip"
+
+          echo "⬇️ 下载 Chrome for Testing ${CFM_VERSION}"
+          mkdir -p /tmp/chrome-for-testing
+          cd /tmp/chrome-for-testing
+
+          download_ok=0
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/"; do
+            echo "尝试: ${PREFIX}${URL}"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 \
+                 -o chrome-linux64.zip "${PREFIX}${URL}"; then
+              if file chrome-linux64.zip | grep -q 'Zip archive'; then
+                download_ok=1
+                break
+              fi
+              rm -f chrome-linux64.zip
+            fi
+          done
+
+          if [ "$download_ok" != "1" ]; then
+            echo "❌ Chrome for Testing 下载失败"
+            exit 1
+          fi
+
+          unzip -q chrome-linux64.zip
+          rm chrome-linux64.zip
+          chmod +x chrome-linux64/chrome
+          /tmp/chrome-for-testing/chrome-linux64/chrome --version
+
+          # 安装运行时依赖
           sudo apt-get update
-          sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+            libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 libcairo2 \
+            libxshmfence1 || true
+
+          echo "CHROME_PATH=/tmp/chrome-for-testing/chrome-linux64/chrome" >> "$GITHUB_ENV"
+          echo "✅ Chrome for Testing 准备完成"
 
       - name: Install Xvfb
         run: sudo apt-get install -y xvfb
@@ -88,7 +123,7 @@ jobs:
                 download_ok=1
                 break
               else
-                echo "⚠️ 文件不是 zip，继续尝试"
+                echo "⚠️ 文件不是 zip"
                 rm -f nonecap.zip
               fi
             fi
@@ -127,7 +162,7 @@ jobs:
               cp "$MANIFEST_DIR/provision.example.json" "$MANIFEST_DIR/provision.json"
               echo "ℹ️ 使用 provision.example.json（免费额度：每天 100 次）"
             else
-              echo "ℹ️ 未找到 provision.example.json，使用默认配置（免费额度）"
+              echo "ℹ️ 未找到 provision.example.json，使用默认配置"
             fi
           fi
 
@@ -236,6 +271,7 @@ jobs:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           VPS8_PROXY: ${{ steps.singbox.outputs.proxy_ready == 'true' && 'http://127.0.0.1:1081' || '' }}
           NONECAP_EXT_PATH: ${{ env.NONECAP_EXT_PATH }}
+          CHROME_PATH: ${{ env.CHROME_PATH }}
         run: xvfb-run -a python -m src.checkin
 
       - name: Show sing-box log on failure
