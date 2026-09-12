@@ -8,7 +8,7 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -44,13 +44,215 @@ jobs:
       - name: Install Xvfb
         run: sudo apt-get install -y xvfb
 
+      - name: Configure sing-box proxy
+        id: singbox
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          SING_BOX_VERSION: "1.10.7"
+        run: |
+          set -e
+
+          if [ -z "$NODE_LINK" ]; then
+            echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理"
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---------- 1. 下载 sing-box ----------
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64)  SB_ARCH="amd64" ;;
+            aarch64|arm64) SB_ARCH="arm64" ;;
+            *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
+          esac
+
+          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
+
+          echo "⬇️ 下载 sing-box: $URL"
+
+          download_ok=0
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
+            echo "  尝试: ${PREFIX}${URL}"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
+                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
+              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
+                echo "  ✅ 下载成功 (${PREFIX:-direct})"
+                download_ok=1
+                break
+              else
+                echo "  ⚠️ 文件不是 gzip，继续尝试下一个源"
+                rm -f sing-box.tar.gz
+              fi
+            fi
+          done
+
+          if [ "$download_ok" != "1" ]; then
+            echo "❌ sing-box 所有下载源均失败"
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tar -xzf sing-box.tar.gz
+          SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
+          if [ -z "$SING_BOX_DIR" ]; then
+            echo "❌ 解压失败"
+            ls -la
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
+          sudo chmod +x /usr/local/bin/sing-box
+          rm -rf sing-box.tar.gz "$SING_BOX_DIR"
+          sing-box version
+
+          # ---------- 2. 生成 sing-box 配置 ----------
+          echo "📝 解析 vless 链接并生成配置..."
+          python3 << 'PYEOF'
+          import json, sys, os, re
+          from urllib.parse import urlparse, parse_qs
+
+          link = os.environ.get('NODE_LINK', '')
+          if not link:
+              sys.exit(0)
+
+          parsed = urlparse(link)
+          if parsed.scheme != 'vless':
+              print(f"⚠️ 不支持的协议: {parsed.scheme}，跳过")
+              sys.exit(0)
+
+          netloc = parsed.netloc
+          if '@' in netloc:
+              uuid, host_port = netloc.split('@', 1)
+          else:
+              uuid, host_port = '', netloc
+
+          host = ''
+          port = '443'
+          bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if bracket_match:
+              host = bracket_match.group(1)
+              if bracket_match.group(2):
+                  port = bracket_match.group(2)
+          else:
+              if host_port.count(':') > 1:
+                  host = host_port
+              elif ':' in host_port:
+                  host, port = host_port.split(':', 1)
+              else:
+                  host = host_port
+
+          if not host:
+              print(f"❌ 无法解析 host: {host_port}")
+              sys.exit(1)
+
+          params = parse_qs(parsed.query)
+          sni = params.get('sni', [''])[0] or host
+          fp = params.get('fp', [''])[0] or 'chrome'
+          flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
+          type_ = params.get('type', ['tcp'])[0]
+          security = params.get('security', [''])[0]
+          path = params.get('path', [''])[0]
+          host_header = params.get('host', [''])[0] or host
+
+          outbound = {
+              "type": "vless",
+              "tag": "vless-out",
+              "server": host,
+              "server_port": int(port),
+              "uuid": uuid,
+              "flow": flow,
+              "packet_encoding": "packetaddr",
+          }
+
+          if security.lower() != 'none':
+              outbound["tls"] = {
+                  "enabled": True,
+                  "server_name": sni,
+                  "insecure": False,
+                  "utls": {"enabled": True, "fingerprint": fp}
+              }
+
+          if type_ != 'tcp':
+              transport = {"type": type_}
+              if type_ == 'ws':
+                  transport["path"] = path or "/"
+                  transport["headers"] = {"Host": host_header}
+              elif type_ == 'grpc':
+                  transport["service_name"] = path or ""
+              outbound["transport"] = transport
+
+          if security == 'reality':
+              pbk = params.get('pbk', [''])[0]
+              sid = params.get('sid', [''])[0]
+              outbound['tls']['reality'] = {
+                  "enabled": True,
+                  "public_key": pbk,
+                  "short_id": sid
+              }
+
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [outbound],
+              "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
+          }
+
+          with open("sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          print("✅ sing-box-config.json 已生成")
+          PYEOF
+
+          # ---------- 3. 启动 sing-box ----------
+          if [ -f sing-box-config.json ]; then
+            echo "🚀 启动 sing-box..."
+            nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
+            sleep 5
+            if ss -tuln 2>/dev/null | grep -q ':1080' || netstat -tuln 2>/dev/null | grep -q ':1080'; then
+              echo "✅ SOCKS5 代理已启动 (127.0.0.1:1080)"
+              echo "✅ HTTP  代理已启动 (127.0.0.1:1081)"
+              echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ 代理启动失败，日志如下:"
+              cat sing-box.log
+              echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "⚠️ 未生成配置文件，跳过代理启动"
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify proxy
+        if: steps.singbox.outputs.proxy_ready == 'true'
+        run: |
+          echo "===== 直连 IP ====="
+          curl -s --connect-timeout 10 https://api.ipify.org || echo "(直连失败)"
+          echo ""
+          echo "===== 通过代理 IP ====="
+          curl -s --connect-timeout 15 -x http://127.0.0.1:1081 https://api.ipify.org || echo "(代理失败)"
+          echo ""
+          echo "===== 通过代理访问 vps8 ====="
+          curl -s -I --connect-timeout 15 -x http://127.0.0.1:1081 https://vps8.zz.cd/ | head -5 || echo "(访问失败)"
+
       - name: Run checkin
         env:
           VPS8_STORAGE_STATE_B64: ${{ secrets.VPS8_STORAGE_STATE_B64 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VPS8_PROXY: ${{ steps.singbox.outputs.proxy_ready == 'true' && 'http://127.0.0.1:1081' || '' }}
         run: xvfb-run -a python -m src.checkin
+
+      - name: Show sing-box log on failure
+        if: failure()
+        run: |
+          if [ -f sing-box.log ]; then
+            echo "===== sing-box.log (tail 50) ====="
+            tail -50 sing-box.log
+          fi
 
       - name: Show checkin state
         if: always()
