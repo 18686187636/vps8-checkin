@@ -1,9 +1,6 @@
 """DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
 
-约定：
-- 不开 --headless，Github Actions 上靠 xvfb-run 提供虚拟显示
-- 若设置 NONECAP_EXT_PATH，启动 Chrome 时加载 NoneCap 扩展自动解决 hCaptcha
-- 登录方式：注入 GitHub session cookies → 点 GitHub OAuth → 静默登录 vps8
+使用 Chrome for Testing 136（保留 --load-extension）加载 NoneCap 扩展自动解决 hCaptcha。
 """
 
 from __future__ import annotations
@@ -32,24 +29,6 @@ VPS8_BASE = "https://vps8.zz.cd"
 VPS8_LOGIN_URL = f"{VPS8_BASE}/login"
 VPS8_DASHBOARD_URL = f"{VPS8_BASE}/dashboard"
 GITHUB_BASE = "https://github.com/"
-
-_CHROME_CANDIDATES = {
-    "Darwin": [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ],
-    "Linux": [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/snap/bin/chromium",
-    ],
-    "Windows": [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ],
-}
 
 _PLATFORM_UA_PARTS = {
     "Darwin": "Macintosh; Intel Mac OS X 10_15_7",
@@ -84,7 +63,7 @@ return ta.value || '';
 
 
 # ---------------------------------------------------------------------------
-# 兼容不同 DrissionPage 版本的 cookies() API
+# cookies
 # ---------------------------------------------------------------------------
 
 def _all_cookies(page: ChromiumPage) -> list[dict]:
@@ -102,10 +81,6 @@ def _all_cookies(page: ChromiumPage) -> list[dict]:
         print(f"[browser] cookies() 失败: {exc}")
         return []
 
-
-# ---------------------------------------------------------------------------
-# GitHub session 加载
-# ---------------------------------------------------------------------------
 
 def _normalize_cookies(raw: list[dict]) -> list[dict]:
     out: list[dict] = []
@@ -179,7 +154,8 @@ def _detect_chrome_path() -> Optional[str]:
     env_path = os.environ.get("CHROME_PATH")
     if env_path and os.path.exists(env_path):
         return env_path
-    for p in _CHROME_CANDIDATES.get(platform.system(), []):
+    # 兜底
+    for p in ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
         if os.path.exists(p):
             return p
     return None
@@ -248,11 +224,8 @@ def create_page() -> ChromiumPage:
     ext_path = os.environ.get(NONECAP_EXT_ENV, "").strip()
     if ext_path and os.path.isdir(ext_path):
         print(f"[browser] 加载 NoneCap 扩展: {ext_path}")
-        # 关键：必须同时设置这两个启动参数，扩展才能在自动化环境中生效
         co.set_argument("--enable-extensions")
         co.set_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
-        # 某些 Chrome 版本还需要显式允许扩展路径
-        co.set_argument(f"--extensions-load-path={ext_path}")
         try:
             co.add_extension(ext_path)
             print("[browser] add_extension 调用完成")
@@ -273,19 +246,7 @@ def create_page() -> ChromiumPage:
         co.set_user_agent(user_agent)
         print(f"[browser] 使用 User-Agent: {user_agent}")
 
-    page = ChromiumPage(co)
-
-    # 验证扩展是否加载
-    if ext_path:
-        try:
-            exts = page.run_cdp("Browser.getExtensions")
-            print(f"[browser] 浏览器已加载扩展: {len(exts)} 个")
-            for e in exts:
-                print(f"[browser]   - {e.get('name', 'unknown')}")
-        except Exception as exc:
-            print(f"[browser] 获取扩展列表失败: {exc}")
-
-    return page
+    return ChromiumPage(co)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +345,7 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
 
 
 # ---------------------------------------------------------------------------
-# hCaptcha（由 NoneCap 扩展自动处理）
+# hCaptcha 等待（由 NoneCap 扩展自动处理）
 # ---------------------------------------------------------------------------
 
 def _has_hcaptcha_widget(page: ChromiumPage) -> bool:
@@ -403,19 +364,13 @@ def _hcaptcha_response(page: ChromiumPage) -> str:
 
 
 def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
-    """等待 NoneCap 扩展自动解决 hCaptcha。
-
-    NoneCap 会在后台检测 widget、截图挑战区域、调用 API 获取答案，
-    然后用类人光标点击。整个过程通常 5-30 秒。
-    我们只需要轮询 textarea[name="h-captcha-response"] 是否被填充。
-    """
+    """等待 NoneCap 扩展自动解决 hCaptcha。"""
     if not _has_hcaptcha_widget(page):
         print("[hcaptcha] 未检测到 hCaptcha widget，跳过")
         return True
 
     print("[hcaptcha] 检测到 hCaptcha widget，等待 NoneCap 扩展自动解决...")
 
-    # 先看是否已经有 token（可能已经自动通过了）
     if _hcaptcha_response(page):
         print("[hcaptcha] 已存在 response token")
         return True
@@ -430,7 +385,6 @@ def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
             time.sleep(1)
             return True
 
-        # 每 15 秒报告一次进度
         now = time.time()
         if now - last_report >= 15:
             remaining = int(deadline - now)
@@ -439,13 +393,13 @@ def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
 
         time.sleep(1)
 
-    print(f"[hcaptcha] ❌ {timeout}s 内未解决，可能扩展未加载或额度用完")
+    print(f"[hcaptcha] ❌ {timeout}s 内未解决")
     screenshot(page, "03c-hcaptcha-timeout")
     return False
 
 
 # ---------------------------------------------------------------------------
-# 截图
+# 截图 / 清理
 # ---------------------------------------------------------------------------
 
 def clean_screenshots() -> int:
