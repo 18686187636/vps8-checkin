@@ -43,6 +43,95 @@ jobs:
       - name: Install Xvfb
         run: sudo apt-get install -y xvfb
 
+      # ===== 下载并准备 NoneCap 扩展 =====
+      - name: Download NoneCap extension
+        run: |
+          mkdir -p extensions
+          cd extensions
+
+          # 尝试多个镜像下载最新 release
+          NONE_CAP_URL="https://github.com/nonecap/nonecap-extension/releases/latest/download/nonecap-extension.zip"
+
+          download_ok=0
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
+            echo "尝试: ${PREFIX}${NONE_CAP_URL}"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 120 \
+                 -o nonecap.zip "${PREFIX}${NONE_CAP_URL}"; then
+              if file nonecap.zip | grep -q 'Zip archive'; then
+                echo "✅ 下载成功 (${PREFIX:-direct})"
+                download_ok=1
+                break
+              else
+                echo "⚠️ 文件不是 zip，继续尝试"
+                rm -f nonecap.zip
+              fi
+            fi
+          done
+
+          if [ "$download_ok" != "1" ]; then
+            echo "❌ NoneCap 下载失败，将跳过扩展加载"
+            echo "nonecap_ready=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          unzip -o nonecap.zip -d nonecap
+          # 找到 manifest.json 所在目录（zip 可能有一层子目录）
+          MANIFEST_DIR=$(dirname "$(find ./nonecap -name "manifest.json" | head -1)")
+          if [ -z "$MANIFEST_DIR" ]; then
+            echo "❌ 未找到 manifest.json"
+            echo "nonecap_ready=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "扩展目录: $MANIFEST_DIR"
+
+          # 生成 provision.json（如果有 NONE_CAP_KEY 则注入）
+          if [ -n "${{ secrets.NONE_CAP_KEY }}" ]; then
+            cat > "$MANIFEST_DIR/provision.json" <<EOF
+          {
+            "key": "${{ secrets.NONE_CAP_KEY }}",
+            "settings": {
+              "style": "fast",
+              "showOverlay": false
+            }
+          }
+          EOF
+            echo "✅ 已生成 provision.json（含 API Key）"
+          else
+            cp "$MANIFEST_DIR/provision.example.json" "$MANIFEST_DIR/provision.json" 2>/dev/null || true
+            echo "ℹ️ 未配置 NONE_CAP_KEY，使用免费额度（每天 100 次）"
+          fi
+
+          # 输出扩展绝对路径供后续步骤使用
+          echo "NONECAP_EXT_PATH=$(realpath "$MANIFEST_DIR")" >> "$GITHUB_ENV"
+          echo "nonecap_ready=true" >> "$GITHUB_ENV"
+          echo "✅ NoneCap 扩展准备完成"
+
+      # ===== 验证扩展是否加载成功 =====
+      - name: Verify extension loaded
+        if: env.nonecap_ready == 'true'
+        run: |
+          python3 <<'PY'
+          import os
+          from DrissionPage import ChromiumOptions, ChromiumPage
+          co = ChromiumOptions()
+          co.set_argument("--no-sandbox")
+          co.set_argument("--disable-dev-shm-usage")
+          co.set_argument("--disable-gpu")
+          co.add_extension(os.environ["NONECAP_EXT_PATH"])
+          page = ChromiumPage(co)
+          page.get("about:blank")
+          try:
+              exts = page.run_cdp("Browser.getExtensions")
+              print(f"已加载扩展数量: {len(exts)}")
+              for e in exts:
+                  print(f"  - {e.get('name', 'unknown')}")
+          except Exception as ex:
+              print(f"获取扩展列表失败: {ex}")
+          page.quit()
+          PY
+        continue-on-error: true
+
       - name: Configure sing-box proxy
         id: singbox
         env:
@@ -143,6 +232,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           VPS8_PROXY: ${{ steps.singbox.outputs.proxy_ready == 'true' && 'http://127.0.0.1:1081' || '' }}
+          NONECAP_EXT_PATH: ${{ env.NONECAP_EXT_PATH }}
         run: xvfb-run -a python -m src.checkin
 
       - name: Show sing-box log on failure
