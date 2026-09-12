@@ -1,10 +1,7 @@
 """DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
 
 登录沿用旧版：同步 JS click 点 GitHub 按钮和 Authorize 按钮。
-优化：
-- 只有带 client_id 参数的授权页才点 Authorize
-- 同一个 URL 只点一次，避免死循环
-- 卡在授权页超过 N 秒自动重试整个流程
+hCaptcha 部分加了详细诊断 dump，便于定位 widget 未渲染的原因。
 """
 
 from __future__ import annotations
@@ -394,7 +391,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
         if "github.com" in url and "/oauth/authorize" in url:
             if "client_id=" in url:
-                # 参数化授权页：点一次 Authorize
                 if authorize_clicked_for_url != url:
                     time.sleep(3)
                     clicked = False
@@ -403,7 +399,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
                             clicked = True
                     except Exception as exc:
                         print(f"[browser] 点击 Authorize 异常: {exc}")
-
                     if not clicked:
                         try:
                             ele = page.ele("xpath://button[@name='authorize']", timeout=3)
@@ -412,7 +407,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
                                 clicked = True
                         except Exception as exc:
                             print(f"[browser] ele 点击 Authorize 异常: {exc}")
-
                     if clicked:
                         print("[browser] 已点击 GitHub Authorize")
                         authorize_clicked_for_url = url
@@ -423,7 +417,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
                         print("[browser] 本轮未点到 Authorize，3 秒后重试")
                         time.sleep(3)
                 else:
-                    # 同一个 URL 已点过，等 N 秒看是否跳走
                     elapsed = time.time() - authorize_clicked_at
                     if elapsed > 20:
                         retry_count += 1
@@ -439,7 +432,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
                     time.sleep(1)
                 continue
             else:
-                # 无参数授权页：等待自动跳转
                 if stuck_at_authorize_since == 0:
                     stuck_at_authorize_since = time.time()
                     print(f"[browser] 授权页无参数（{url}），等待自动跳转")
@@ -477,6 +469,70 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
     screenshot(page, "10-oauth-timeout")
     raise RuntimeError(f"GitHub OAuth 超时，当前 URL: {page.url}")
+
+
+# ---------------------------------------------------------------------------
+# hCaptcha 诊断
+# ---------------------------------------------------------------------------
+
+def dump_hcaptcha_state(page: ChromiumPage, tag: str = "") -> None:
+    """打印页面 hCaptcha 相关的所有信息，用于排查 widget 未渲染的原因。"""
+    js = r"""
+    (() => {
+      const out = {
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        bodyTextLen: (document.body && document.body.innerText || '').length,
+        container_count: document.querySelectorAll('.h-captcha').length,
+        container_outer: (() => {
+          const el = document.querySelector('.h-captcha');
+          return el ? (el.outerHTML || '').slice(0, 400) : '';
+        })(),
+        hcaptcha_scripts: Array.from(document.querySelectorAll('script')).filter(s =>
+          (s.src || '').toLowerCase().includes('hcaptcha')
+        ).map(s => s.src),
+        iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({
+          src: (f.src || '').slice(0, 120),
+          w: f.offsetWidth,
+          h: f.offsetHeight,
+        })),
+        has_window_hcaptcha: typeof window.hcaptcha !== 'undefined',
+        hcaptcha_response_value: (() => {
+          const ta = document.querySelector('textarea[name="h-captcha-response"]');
+          return ta ? (ta.value || '').slice(0, 40) : '';
+        })(),
+      };
+      return JSON.stringify(out);
+    })()
+    """
+    prefix = f"[hcaptcha-dump{(' ' + tag) if tag else ''}]"
+    try:
+        raw = page.run_js(js)
+    except Exception as exc:
+        print(f"{prefix} run_js 失败: {exc}")
+        return
+    if not raw:
+        print(f"{prefix} 无数据")
+        return
+    try:
+        info = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        print(f"{prefix} JSON 解析失败: {exc}, raw={raw!r}")
+        return
+    print(f"{prefix} URL: {info.get('url')}")
+    print(f"{prefix} title: {info.get('title')!r}")
+    print(f"{prefix} readyState: {info.get('readyState')}, bodyTextLen: {info.get('bodyTextLen')}")
+    print(f"{prefix} .h-captcha 数量: {info.get('container_count')}")
+    if info.get("container_outer"):
+        print(f"{prefix} .h-captcha outer: {info['container_outer']!r}")
+    print(f"{prefix} hcaptcha scripts: {info.get('hcaptcha_scripts')}")
+    print(f"{prefix} window.hcaptcha: {info.get('has_window_hcaptcha')}")
+    print(f"{prefix} h-captcha-response 值: {info.get('hcaptcha_response_value')!r}")
+    iframes = info.get("iframes", [])
+    print(f"{prefix} iframes ({len(iframes)}):")
+    for f in iframes:
+        print(f"{prefix}   src={f['src']!r} size={f['w']}x{f['h']}")
 
 
 # ---------------------------------------------------------------------------
