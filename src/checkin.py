@@ -3,9 +3,8 @@
 流程：
     1. GitHub OAuth 静默登录 vps8
     2. 进入签到页
-    3. 检测验证码类型
-    4. reCAPTCHA → 优先音频识别；失败回退 2captcha
-       hCaptcha / Turnstile → 直接 2captcha
+    3. 等待验证码 widget（最长 120 秒）
+    4. reCAPTCHA → 音频识别（失败回退 2captcha）
     5. 提交签到表单
 """
 
@@ -23,7 +22,7 @@ DASHBOARD_URL = f"{BASE_URL}/dashboard"
 CHECKIN_URL = f"{BASE_URL}/points/signin"
 
 MAX_ATTEMPTS = 3
-RETRY_INTERVAL_SECONDS = 30
+RETRY_INTERVAL_SECONDS = 90
 SUCCESS_SNAPSHOT_DELAY_SECONDS = 3
 
 CHECKED_TEXT_MARKERS = (
@@ -131,7 +130,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
     # ===== 2. 进入签到页 =====
     print(f"[checkin] 访问签到页: {CHECKIN_URL}")
     page.get(CHECKIN_URL)
-    time.sleep(4)
+    time.sleep(5)
 
     if "/login" in (page.url or ""):
         browser.screenshot(page, "00-session-expired")
@@ -140,7 +139,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
     print(f"[checkin] 签到页 URL: {page.url}")
     browser.screenshot(page, "03-checkin-page")
 
-    time.sleep(2)
+    time.sleep(3)
 
     if _is_already_checked_in(page):
         print("[checkin] 今日已签到（服务端确认）")
@@ -148,46 +147,67 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    # ===== 3. 等验证码 widget 渲染 =====
-    print("[checkin] 等待验证码 widget 渲染（最多 60 秒）...")
-    captcha_info = browser.wait_captcha_widget(page, timeout=60)
+    # ===== 3. 等验证码 widget 渲染（120 秒）=====
+    print("[checkin] 等待验证码 widget 渲染（最多 120 秒）...")
+    captcha_info = browser.wait_captcha_widget(page, timeout=120)
     print(f"[checkin] 检测到的验证码: {captcha_info}")
     browser.screenshot(page, "03c-captcha-widget")
 
     captcha_solved = False
+    ctype = captcha_info.get("type", "none")
 
-    if captcha_info.get("type") == "recaptcha":
-        # 4a. 优先用音频识别
+    if ctype == "recaptcha":
         print("[checkin] 尝试音频识别求解 reCAPTCHA...")
-        if browser.solve_recaptcha_via_audio(page, timeout=90):
+        if browser.solve_recaptcha_via_audio(page, timeout=120):
             print("[checkin] ✅ 音频识别成功")
             captcha_solved = True
         else:
             print("[checkin] 音频识别失败，将回退 2captcha")
-    elif captcha_info.get("type") == "none":
-        print("[checkin] 未检测到验证码，直接尝试提交")
-        captcha_solved = True
-    else:
-        print(f"[checkin] 验证码类型 {captcha_info['type']} 需用 2captcha")
+    elif ctype == "none":
+        print("[checkin] ⚠️ 未检测到验证码 widget，先刷新页面再等一轮")
+        page.refresh()
+        time.sleep(5)
+        browser.screenshot(page, "03c-refresh-retry")
 
-    # 4b. 音频失败或无 API key → 用 2captcha
-    if not captcha_solved and captcha_info.get("type") != "none":
+        if _is_already_checked_in(page):
+            print("[checkin] 刷新后已显示已签到")
+            time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
+            browser.screenshot(page, "05-success")
+            return "本日已签到"
+
+        print("[checkin] 第二轮等待 widget（60 秒）...")
+        captcha_info = browser.wait_captcha_widget(page, timeout=60)
+        ctype = captcha_info.get("type", "none")
+        print(f"[checkin] 第二轮检测: {captcha_info}")
+        browser.screenshot(page, "03d-captcha-widget-2")
+
+        if ctype == "recaptcha":
+            if browser.solve_recaptcha_via_audio(page, timeout=120):
+                captcha_solved = True
+        elif ctype == "none":
+            print("[checkin] 仍未检测到验证码，按无验证码直接提交")
+            captcha_solved = True
+    else:
+        print(f"[checkin] 验证码类型 {ctype}，需要用 2captcha")
+
+    # ===== 4. 2captcha 兜底 =====
+    if not captcha_solved and ctype != "none":
         if not captcha_api_key:
-            browser.screenshot(page, "03d-no-apikey")
+            browser.screenshot(page, "03e-no-apikey")
             raise CaptchaTimeout(
-                f"{captcha_info['type']} 音频识别失败且未配置 CAPTCHA_API_KEY"
+                f"{ctype} 音频识别失败且未配置 CAPTCHA_API_KEY"
             )
-        print(f"[checkin] 用 2captcha 解决 {captcha_info['type']}...")
+        print(f"[checkin] 用 2captcha 解决 {ctype}...")
         token = browser.solve_captcha_via_2captcha(
             page, captcha_api_key, captcha_info, timeout=240
         )
         if not token:
-            browser.screenshot(page, "03d-2captcha-fail")
-            raise CaptchaTimeout(f"2captcha 未能解决 {captcha_info['type']}")
+            browser.screenshot(page, "03e-2captcha-fail")
+            raise CaptchaTimeout(f"2captcha 未能解决 {ctype}")
         browser.inject_captcha_token(page, token)
         captcha_solved = True
         time.sleep(2)
-        browser.screenshot(page, "03e-token-injected")
+        browser.screenshot(page, "03f-token-injected")
 
     # ===== 5. 点击签到按钮 =====
     print("[checkin] 点击签到按钮")
@@ -200,7 +220,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
         raise CheckinElementsNotFound("未找到签到按钮")
 
     print("[checkin] 已点击签到按钮")
-    time.sleep(3)
+    time.sleep(4)
     browser.screenshot(page, "04-after-click")
 
     # ===== 6. 确认签到成功 =====
