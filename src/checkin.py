@@ -97,6 +97,7 @@ def _verify_session(page) -> None:
     time.sleep(2)
 
     _dump_cookies(page)
+    print(f"[checkin] 当前 URL: {page.url}")
 
     if "/login" in page.url:
         browser.screenshot(page, "00-session-expired")
@@ -271,6 +272,9 @@ def main() -> int:
         page = None
         try:
             page = browser.create_page(cookies=cookies)
+            # 双保险：即使 create_page 未接住，也显式再注入一次
+            browser.apply_cookies(page, cookies)
+
             status = do_checkin(page)
             state.mark_success()
             _send_result_snapshot(page, status, "06-result")
