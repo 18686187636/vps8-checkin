@@ -76,7 +76,6 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
 
 
 def _dump_cookies(page) -> None:
-    """打印浏览器实际持有的 cookie，方便排查登录态问题。"""
     try:
         actual = page.cookies(as_dict=False)
     except Exception as exc:
@@ -92,20 +91,14 @@ def _dump_cookies(page) -> None:
 
 
 def _verify_session(page) -> None:
-    """先访问首页让反爬中间件种 token，再访问 dashboard 校验登录态。"""
+    """直接访问 dashboard 和签到页。
 
-    # ---- 第 1 步：访问首页 ----
-    print(f"[checkin] [1/3] 访问首页，让反爬中间件种 cookie: {BASE_URL}/")
-    try:
-        page.get(BASE_URL + "/")
-        time.sleep(2.5)
-        print(f"[checkin] 首页后 URL: {page.url}")
-        _dump_cookies(page)
-    except Exception as exc:
-        print(f"[checkin] 访问首页异常: {exc}")
+    重要：不要访问 /（首页），否则 FOSSBilling 会重置会话，
+    把我们的 PHPSESSID 覆盖掉。
+    """
 
-    # ---- 第 2 步：访问 dashboard ----
-    print(f"[checkin] [2/3] 访问 dashboard: {DASHBOARD_URL}")
+    # ---- 第 1 步：直接访问 dashboard ----
+    print(f"[checkin] [1/2] 访问 dashboard: {DASHBOARD_URL}")
     try:
         page.get(DASHBOARD_URL)
         time.sleep(2.5)
@@ -114,8 +107,20 @@ def _verify_session(page) -> None:
     except Exception as exc:
         print(f"[checkin] 访问 dashboard 异常: {exc}")
 
-    # ---- 第 3 步：直接去签到页确认 ----
-    print(f"[checkin] [3/3] 直接访问签到页: {CHECKIN_URL}")
+    # 若 dashboard 被 JS 跳走，等一下再看
+    if "/dashboard" not in (page.url or ""):
+        time.sleep(2)
+        print(f"[checkin] 等待后 URL: {page.url}")
+
+    if "/login" in (page.url or ""):
+        browser.screenshot(page, "00-session-expired")
+        raise LoginFailed(
+            f"登录态已失效（当前 URL: {page.url}），"
+            "请重新导出 cookies 并更新 VPS8_STORAGE_STATE_B64"
+        )
+
+    # ---- 第 2 步：直接访问签到页 ----
+    print(f"[checkin] [2/2] 访问签到页: {CHECKIN_URL}")
     try:
         page.get(CHECKIN_URL)
         time.sleep(2.5)
@@ -127,7 +132,7 @@ def _verify_session(page) -> None:
     if "/login" in (page.url or ""):
         browser.screenshot(page, "00-session-expired")
         raise LoginFailed(
-            f"登录态已失效（当前 URL: {page.url}），"
+            f"签到页被重定向到 login（{page.url}），"
             "请重新导出 cookies 并更新 VPS8_STORAGE_STATE_B64"
         )
 
@@ -181,7 +186,7 @@ def _confirm_checkin_success(page, timeout: int = 20) -> bool:
 def do_checkin(page) -> str:
     _verify_session(page)
 
-    # _verify_session 结束时已经停在 /points/signin 上，等 SPA 渲染
+    # _verify_session 结束时已停在 /points/signin，等 SPA 渲染
     time.sleep(2)
     page_text = _visible_page_text(page)
 
