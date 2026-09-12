@@ -92,59 +92,47 @@ def _dump_cookies(page) -> None:
 
 
 def _verify_session(page) -> None:
-    print(f"[checkin] 校验登录态: {DASHBOARD_URL}")
-    page.get(DASHBOARD_URL)
-    time.sleep(2)
+    """先访问首页让反爬中间件种 token，再访问 dashboard 校验登录态。"""
 
-    _dump_cookies(page)
-    print(f"[checkin] 当前 URL: {page.url}")
+    # ---- 第 1 步：访问首页 ----
+    print(f"[checkin] [1/3] 访问首页，让反爬中间件种 cookie: {BASE_URL}/")
+    try:
+        page.get(BASE_URL + "/")
+        time.sleep(2.5)
+        print(f"[checkin] 首页后 URL: {page.url}")
+        _dump_cookies(page)
+    except Exception as exc:
+        print(f"[checkin] 访问首页异常: {exc}")
 
-    if "/login" in page.url:
+    # ---- 第 2 步：访问 dashboard ----
+    print(f"[checkin] [2/3] 访问 dashboard: {DASHBOARD_URL}")
+    try:
+        page.get(DASHBOARD_URL)
+        time.sleep(2.5)
+        print(f"[checkin] dashboard 后 URL: {page.url}")
+        _dump_cookies(page)
+    except Exception as exc:
+        print(f"[checkin] 访问 dashboard 异常: {exc}")
+
+    # ---- 第 3 步：直接去签到页确认 ----
+    print(f"[checkin] [3/3] 直接访问签到页: {CHECKIN_URL}")
+    try:
+        page.get(CHECKIN_URL)
+        time.sleep(2.5)
+        print(f"[checkin] 签到页 URL: {page.url}")
+        _dump_cookies(page)
+    except Exception as exc:
+        print(f"[checkin] 访问签到页异常: {exc}")
+
+    if "/login" in (page.url or ""):
         browser.screenshot(page, "00-session-expired")
         raise LoginFailed(
-            "登录态已失效，请重新导出 cookies 并更新 VPS8_STORAGE_STATE_B64"
+            f"登录态已失效（当前 URL: {page.url}），"
+            "请重新导出 cookies 并更新 VPS8_STORAGE_STATE_B64"
         )
 
     print(f"[checkin] 登录态有效，当前 URL: {page.url}")
     browser.screenshot(page, "02-after-login")
-
-
-def _go_to_checkin_page(page) -> None:
-    js = r"""
-    const isVisible = (el) => {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return style.display !== 'none'
-        && style.visibility !== 'hidden'
-        && rect.width > 0
-        && rect.height > 0;
-    };
-    const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-    const target = candidates.find((el) => {
-      if (!isVisible(el)) return false;
-      const text = (el.innerText || el.textContent || '').trim();
-      return text === '签到' || text === '签 到';
-    });
-    if (!target) return false;
-    target.scrollIntoView({block: 'center', inline: 'center'});
-    target.click();
-    return true;
-    """
-    clicked = False
-    try:
-        clicked = bool(page.run_js(js))
-    except Exception as exc:
-        print(f"[checkin] JS 点击签到入口失败: {exc}")
-
-    if clicked:
-        print("[checkin] 已点击顶部「签到」")
-        time.sleep(2)
-    else:
-        print(f"[checkin] 未找到导航「签到」入口，直接访问 {CHECKIN_URL}")
-        page.get(CHECKIN_URL)
-        time.sleep(2)
-
-    browser.screenshot(page, "03-checkin-page")
 
 
 def _click_checkin_action(page) -> bool:
@@ -192,8 +180,8 @@ def _confirm_checkin_success(page, timeout: int = 20) -> bool:
 
 def do_checkin(page) -> str:
     _verify_session(page)
-    _go_to_checkin_page(page)
 
+    # _verify_session 结束时已经停在 /points/signin 上，等 SPA 渲染
     time.sleep(2)
     page_text = _visible_page_text(page)
 
