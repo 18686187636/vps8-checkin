@@ -21,20 +21,17 @@ jobs:
 
       - name: Debug - source check
         run: |
-          echo "===== 目录结构 ====="
-          ls -la
+          echo "===== src/ 目录 ====="
+          ls -la src/ || echo "src/ 不存在"
           echo ""
-          echo "===== src/ 内容 ====="
-          ls -la src/ 2>/dev/null || echo "src/ 目录不存在"
+          echo "===== checkin.py 调用 create_page / apply_cookies 的地方 ====="
+          grep -n "create_page\|apply_cookies" src/checkin.py || echo "无匹配"
           echo ""
-          echo "===== browser.py create_page 签名 ====="
-          grep -n "def create_page" src/browser.py || echo "找不到 create_page"
+          echo "===== browser.py 关键函数签名 ====="
+          grep -n "def create_page\|def apply_cookies\|def _inject_cookies" src/browser.py || echo "无匹配"
           echo ""
-          echo "===== browser.py _inject_cookies 是否存在 ====="
-          grep -n "_inject_cookies" src/browser.py || echo "找不到 _inject_cookies"
-          echo ""
-          echo "===== checkin.py 调用处 ====="
-          grep -n "create_page" src/checkin.py || echo "找不到 create_page 调用"
+          echo "===== browser.py 是否真的调用了 _inject_cookies ====="
+          grep -n "_inject_cookies(page" src/browser.py || echo "无匹配"
 
       - name: Compute Beijing date
         id: bjdate
@@ -91,6 +88,7 @@ jobs:
           PY
 
           PHP=$(cat /tmp/php.txt)
+          echo ""
           echo "===== curl /dashboard ====="
           curl -s -i -o /tmp/resp.txt \
             -H "Cookie: PHPSESSID=$PHP" \
