@@ -1,7 +1,4 @@
-"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
-
-使用 Chrome for Testing 136（保留 --load-extension）加载 NoneCap 扩展自动解决 hCaptcha。
-"""
+"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。"""
 
 from __future__ import annotations
 
@@ -154,7 +151,6 @@ def _detect_chrome_path() -> Optional[str]:
     env_path = os.environ.get("CHROME_PATH")
     if env_path and os.path.exists(env_path):
         return env_path
-    # 兜底
     for p in ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
         if os.path.exists(p):
             return p
@@ -192,7 +188,7 @@ def _resolve_user_agent(chrome_path: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 创建页面（含 NoneCap 扩展加载）
+# 创建页面
 # ---------------------------------------------------------------------------
 
 def create_page() -> ChromiumPage:
@@ -209,7 +205,6 @@ def create_page() -> ChromiumPage:
     co.set_pref("credentials_enable_service", False)
     co.set_pref("profile.password_manager_enabled", False)
 
-    # ---- 代理 ----
     proxy = os.environ.get(PROXY_ENV, "").strip()
     if proxy:
         print(f"[browser] 使用代理: {proxy}")
@@ -220,7 +215,6 @@ def create_page() -> ChromiumPage:
     else:
         print("[browser] 未配置代理，直连")
 
-    # ---- NoneCap 扩展 ----
     ext_path = os.environ.get(NONECAP_EXT_ENV, "").strip()
     if ext_path and os.path.isdir(ext_path):
         print(f"[browser] 加载 NoneCap 扩展: {ext_path}")
@@ -345,14 +339,24 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
 
 
 # ---------------------------------------------------------------------------
-# hCaptcha 等待（由 NoneCap 扩展自动处理）
+# hCaptcha
 # ---------------------------------------------------------------------------
 
-def _has_hcaptcha_widget(page: ChromiumPage) -> bool:
+def has_hcaptcha_widget(page: ChromiumPage) -> bool:
     try:
         return bool(page.run_js(HAS_HCAPTCHA_JS))
     except Exception:
         return False
+
+
+def wait_hcaptcha_widget(page: ChromiumPage, timeout: int = 30) -> bool:
+    """等待 hCaptcha widget 在页面上渲染出来。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if has_hcaptcha_widget(page):
+            return True
+        time.sleep(1)
+    return False
 
 
 def _hcaptcha_response(page: ChromiumPage) -> str:
@@ -365,9 +369,9 @@ def _hcaptcha_response(page: ChromiumPage) -> str:
 
 def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
     """等待 NoneCap 扩展自动解决 hCaptcha。"""
-    if not _has_hcaptcha_widget(page):
-        print("[hcaptcha] 未检测到 hCaptcha widget，跳过")
-        return True
+    if not has_hcaptcha_widget(page):
+        print("[hcaptcha] 未检测到 hCaptcha widget")
+        return False
 
     print("[hcaptcha] 检测到 hCaptcha widget，等待 NoneCap 扩展自动解决...")
 
