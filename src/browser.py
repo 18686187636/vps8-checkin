@@ -1,7 +1,8 @@
 """DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
 
 使用 Chrome for Testing 136（保留 --load-extension）加载 NoneCap 扩展自动解决 hCaptcha。
-GitHub 登录优先直接 GET /github/login，绕过按钮点击；Authorize 按钮用 CDP 真实鼠标事件点击。
+GitHub 登录优先直接 GET /github/login，绕过按钮点击；
+Authorize 用 form.submit() 兜底，避免按钮定位问题。
 """
 
 from __future__ import annotations
@@ -376,58 +377,32 @@ def _cdp_click_element(page: ChromiumPage, find_element_expr: str) -> bool:
         return False
 
 
-def _dump_buttons(page: ChromiumPage) -> None:
-    js = r"""
-    (() => {
-      const btns = Array.from(document.querySelectorAll(
-        'button, input[type="submit"], a[role="button"]'
-      ));
-      return JSON.stringify(btns.map(b => ({
-          tag: b.tagName.toLowerCase(),
-          name: b.getAttribute('name') || '',
-          value: b.getAttribute('value') || '',
-          text: (b.innerText || b.textContent || b.value || '').trim().slice(0, 80),
-          visible: (() => {
-              const s = window.getComputedStyle(b);
-              const r = b.getBoundingClientRect();
-              return s.display !== 'none' && s.visibility !== 'hidden'
-                  && r.width > 0 && r.height > 0;
-          })(),
-      })));
-    })()
-    """
-    try:
-        raw = page.run_js(js)
-        btns = json.loads(raw) if raw else []
-        print(f"[browser] 页面按钮数: {len(btns)}")
-        for b in btns:
-            print(
-                f"[browser]   <{b['tag']} name={b['name']!r} value={b['value']!r} "
-                f"visible={b['visible']}> {b['text']!r}"
-            )
-    except Exception as exc:
-        print(f"[browser] dump 按钮失败: {exc}")
-
-
-def _dump_page_elements(page: ChromiumPage) -> None:
+def _dump_github_authorize_page(page: ChromiumPage) -> None:
+    """专门 dump GitHub 授权页的所有元素，包括 button / input / a / form。"""
     js = r"""
     (() => {
       const out = {url: location.href, title: document.title};
-      out.links = Array.from(document.querySelectorAll('a')).map(a => ({
-        href: (a.getAttribute('href') || '').slice(0, 120),
-        text: (a.innerText || a.textContent || '').trim().slice(0, 60),
-        visible: (() => {
-          const s = window.getComputedStyle(a);
-          const r = a.getBoundingClientRect();
-          return s.display !== 'none' && s.visibility !== 'hidden'
-            && r.width > 0 && r.height > 0;
-        })(),
+      out.forms = Array.from(document.querySelectorAll('form')).map(f => ({
+        action: f.getAttribute('action') || '',
+        method: (f.getAttribute('method') || 'get').toUpperCase(),
+        inputs: Array.from(f.querySelectorAll('input, button, textarea')).map(el => ({
+          tag: el.tagName.toLowerCase(),
+          type: el.getAttribute('type') || '',
+          name: el.getAttribute('name') || '',
+          value: (el.getAttribute('value') || '').slice(0, 40),
+          text: (el.innerText || el.textContent || '').trim().slice(0, 40),
+        })),
       }));
-      out.buttons = Array.from(document.querySelectorAll('button, [role="button"]')).map(b => ({
-        text: (b.innerText || b.textContent || '').trim().slice(0, 60),
+      out.allInteractive = Array.from(document.querySelectorAll('button, input, a')).map(el => ({
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type') || '',
+        name: el.getAttribute('name') || '',
+        value: (el.getAttribute('value') || '').slice(0, 40),
+        href: (el.getAttribute('href') || '').slice(0, 80),
+        text: (el.innerText || el.textContent || '').trim().slice(0, 40),
         visible: (() => {
-          const s = window.getComputedStyle(b);
-          const r = b.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
           return s.display !== 'none' && s.visibility !== 'hidden'
             && r.width > 0 && r.height > 0;
         })(),
@@ -439,22 +414,70 @@ def _dump_page_elements(page: ChromiumPage) -> None:
         raw = page.run_js(js)
         info = json.loads(raw) if raw else None
         if not info:
-            print("[browser] dump 页面元素：无数据")
+            print("[browser] dump 授权页：无数据")
             return
-        print(f"[browser] 当前 URL: {info.get('url')}")
-        print(f"[browser] 页面标题: {info.get('title')!r}")
-        links = info.get("links", [])
-        print(f"[browser] 链接数: {len(links)}")
-        for l in links:
-            if l.get("visible"):
-                print(f"[browser]   a: href={l['href']!r} text={l['text']!r}")
-        buttons = info.get("buttons", [])
-        print(f"[browser] 按钮数: {len(buttons)}")
-        for b in buttons:
-            if b.get("visible"):
-                print(f"[browser]   button: text={b['text']!r}")
+        print(f"[browser] 授权页 URL: {info.get('url')}")
+        print(f"[browser] 授权页标题: {info.get('title')!r}")
+        for i, f in enumerate(info.get("forms", [])):
+            print(f"[browser] form #{i}: action={f['action']!r} method={f['method']}")
+            for el in f["inputs"]:
+                print(
+                    f"[browser]   <{el['tag']} type={el['type']!r} name={el['name']!r} "
+                    f"value={el['value']!r}> {el['text']!r}"
+                )
+        print(f"[browser] 交互元素总数: {len(info.get('allInteractive', []))}")
+        for el in info.get("allInteractive", []):
+            if el["visible"]:
+                print(
+                    f"[browser]   <{el['tag']} type={el['type']!r} name={el['name']!r} "
+                    f"value={el['value']!r} href={el['href']!r}> {el['text']!r}"
+                )
     except Exception as exc:
-        print(f"[browser] dump 页面元素失败: {exc}")
+        print(f"[browser] dump 授权页失败: {exc}")
+
+
+def _submit_github_authorize_form(page: ChromiumPage) -> bool:
+    """直接提交 GitHub 授权表单，绕过按钮点击。
+
+    GitHub 授权页本质是一个 POST form，submit 它等于点了 Authorize。
+    """
+    js = r"""
+    (() => {
+      const forms = Array.from(document.querySelectorAll('form'));
+      for (const f of forms) {
+        const html = (f.innerHTML || '').toLowerCase();
+        const action = (f.getAttribute('action') || '').toLowerCase();
+        // 找带有 authorize 字段的 form
+        const hasAuthorize = html.includes('authorize')
+          || action.includes('authorize')
+          || action.includes('/sessions');
+        if (!hasAuthorize) continue;
+        // 检查 form 里是否有 name=authorize 的按钮
+        const authBtn = f.querySelector('[name="authorize"]');
+        if (!authBtn) continue;
+        try {
+          f.submit();
+          return JSON.stringify({ok: true, action: f.getAttribute('action') || ''});
+        } catch (e) {
+          return JSON.stringify({ok: false, reason: 'submit-error: ' + e.message});
+        }
+      }
+      return JSON.stringify({ok: false, reason: 'no-authorize-form'});
+    })()
+    """
+    try:
+        raw = page.run_js(js)
+    except Exception as exc:
+        print(f"[browser] form.submit() 异常: {exc}")
+        return False
+    print(f"[browser] form.submit() 返回: {raw!r}")
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return False
+    return bool(data.get("ok"))
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +531,6 @@ def is_logged_in(page: ChromiumPage) -> bool:
 
 def _click_github_login_button(page: ChromiumPage) -> bool:
     """点 GitHub 登录按钮：优先 ele.click()，兜底 CDP。"""
-    # 方式 A：DrissionPage 原生 click
     try:
         ele = page.ele("xpath://a[contains(@href, '/github/login')]", timeout=5)
         if ele is None:
@@ -520,7 +542,6 @@ def _click_github_login_button(page: ChromiumPage) -> bool:
     except Exception as exc:
         print(f"[browser] ele.click() 失败: {exc}")
 
-    # 方式 B：CDP 真实鼠标事件
     if page.run_js(f"return !!({FIND_GITHUB_LOGIN_BTN_JS});"):
         if _cdp_click_element(page, FIND_GITHUB_LOGIN_BTN_JS):
             print("[browser] CDP 点击 GitHub 按钮成功")
@@ -538,13 +559,12 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
     print("[browser] 未登录，走 GitHub OAuth 流程")
 
-    # ---- 2. 直接 GET /github/login，绕过按钮 ----
+    # ---- 2. 直接 GET /github/login ----
     print(f"[browser] 直接访问: {VPS8_GITHUB_LOGIN_URL}")
     page.get(VPS8_GITHUB_LOGIN_URL)
     time.sleep(4)
     print(f"[browser] 访问后 URL: {page.url}")
 
-    # 如果 /github/login 没有触发跳转，说明服务端需要从登录页点按钮
     if "vps8.zz.cd" in (page.url or "") and "/login" in (page.url or ""):
         print("[browser] /github/login 未触发跳转，回退到点击按钮")
         page.get(VPS8_LOGIN_URL)
@@ -552,7 +572,7 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
 
         if not page.run_js(f"return !!({FIND_GITHUB_LOGIN_BTN_JS});"):
             print("[browser] ❌ 找不到 GitHub 按钮，dump 页面内容：")
-            _dump_page_elements(page)
+            _dump_github_authorize_page(page)
             screenshot(page, "10-no-github-button")
             raise RuntimeError("找不到 GitHub 登录按钮")
 
@@ -567,8 +587,9 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
     deadline = time.time() + timeout
     last_url = ""
     authorize_attempts = 0
-    MAX_AUTHORIZE_ATTEMPTS = 3
+    MAX_AUTHORIZE_ATTEMPTS = 5
     stuck_at_login_since = 0.0
+    authorize_submitted = False
 
     while time.time() < deadline:
         try:
@@ -578,6 +599,7 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
         if url and url != last_url:
             print(f"[browser] URL: {url}")
             last_url = url
+            authorize_submitted = False  # URL 变了，重置提交标记
 
         # access_denied → 重试
         if "access_denied" in url or "error=access_denied" in url:
@@ -595,31 +617,49 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
             stuck_at_login_since = 0
             continue
 
-        # GitHub 授权页 → 点 Authorize
+        # GitHub 授权页 → dump + 提交表单
         if "github.com" in url and ("/login/oauth/authorize" in url or "/oauth/authorize" in url):
-            print("[browser] 检测到 GitHub 授权页，dump 按钮信息")
-            _dump_buttons(page)
-
-            if _cdp_click_element(page, FIND_AUTHORIZE_BTN_JS):
-                print("[browser] 已点击 Authorize 按钮（CDP）")
+            if not authorize_submitted:
+                # 等页面渲染完
                 time.sleep(3)
-                continue
+                print("[browser] 检测到 GitHub 授权页，dump 页面结构")
+                _dump_github_authorize_page(page)
+                screenshot(page, "10-github-authorize")
 
-            print("[browser] CDP 点击 Authorize 失败，尝试 ele 兜底")
-            try:
-                ele = page.ele(
-                    "xpath://button[@name='authorize' and @value='1']",
-                    timeout=5,
-                )
-                if ele:
-                    ele.click()
-                    print("[browser] ele.click() 点击 Authorize 成功")
-                    time.sleep(3)
+                # 优先：直接提交 form
+                if _submit_github_authorize_form(page):
+                    print("[browser] ✅ 已通过 form.submit() 提交授权")
+                    authorize_submitted = True
+                    time.sleep(4)
                     continue
-            except Exception as exc:
-                print(f"[browser] 兜底点击 Authorize 异常: {exc}")
-            screenshot(page, "10-no-authorize-btn")
-            raise RuntimeError("GitHub 授权页找不到 Authorize 按钮")
+
+                # 兜底：CDP 点击
+                if _cdp_click_element(page, FIND_AUTHORIZE_BTN_JS):
+                    print("[browser] ✅ 已通过 CDP 点击 Authorize")
+                    authorize_submitted = True
+                    time.sleep(4)
+                    continue
+
+                # 再兜底：ele.click()
+                try:
+                    ele = page.ele("xpath://button[@name='authorize']", timeout=3)
+                    if ele:
+                        ele.click()
+                        print("[browser] ✅ 已通过 ele.click() 点击 Authorize")
+                        authorize_submitted = True
+                        time.sleep(4)
+                        continue
+                except Exception as exc:
+                    print(f"[browser] ele.click() 异常: {exc}")
+
+                print("[browser] ⚠️ 三种方式都失败，等 5 秒再试一次")
+                authorize_submitted = True  # 让下一轮循环重新进入 dump 逻辑
+                time.sleep(5)
+                # 重置标记以便下一轮再试
+                authorize_submitted = False
+            else:
+                time.sleep(1)
+            continue
 
         # 成功回到 vps8
         if "vps8.zz.cd" in url and "/login" not in url and "/github" not in url:
