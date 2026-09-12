@@ -45,40 +45,24 @@ jobs:
         run: |
           set -e
           if [ -z "$NODE_LINK" ]; then
-            echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理"
             echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           ARCH="$(uname -m)"
           case "$ARCH" in
             x86_64|amd64)  SB_ARCH="amd64" ;;
             aarch64|arm64) SB_ARCH="arm64" ;;
-            *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
+            *) exit 1 ;;
           esac
-
           PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
           URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
-
-          download_ok=0
           for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
             if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
                  -o sing-box.tar.gz "${PREFIX}${URL}"; then
-              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
-                download_ok=1
-                break
-              else
-                rm -f sing-box.tar.gz
-              fi
+              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then break; fi
+              rm -f sing-box.tar.gz
             fi
           done
-
-          if [ "$download_ok" != "1" ]; then
-            echo "❌ sing-box 下载失败"
-            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           tar -xzf sing-box.tar.gz
           SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
           sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
@@ -139,11 +123,9 @@ jobs:
 
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
           sleep 5
-          if ss -tuln 2>/dev/null | grep -q ':1080' || netstat -tuln 2>/dev/null | grep -q ':1080'; then
-            echo "✅ 代理已启动"
+          if ss -tuln 2>/dev/null | grep -q ':1080'; then
             echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
           else
-            echo "❌ 代理启动失败"
             cat sing-box.log
             echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
           fi
@@ -163,22 +145,23 @@ jobs:
         run: |
           sudo websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           sleep 3
-          curl -s http://localhost:6080/ > /dev/null && echo "noVNC 就绪"
+          curl -s http://localhost:6080/vnc.html > /dev/null && echo "noVNC 就绪"
 
       - name: Start cloudflared tunnel
         run: |
           cloudflared tunnel --url http://localhost:6080 > /tmp/cloudflared.log 2>&1 &
           sleep 20
           grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 > /tmp/tunnel_url.txt
-          URL=$(cat /tmp/tunnel_url.txt)
-          if [ -z "$URL" ]; then
+          BASE=$(cat /tmp/tunnel_url.txt)
+          if [ -z "$BASE" ]; then
             echo "❌ 未获取到 tunnel URL"
             cat /tmp/cloudflared.log
             exit 1
           fi
+          URL="${BASE}/vnc.html?autoconnect=1&resize=scale"
           echo "Tunnel URL: $URL"
           {
-            echo "## noVNC 地址";
+            echo "## noVNC 地址（点击直接进桌面）";
             echo "";
             echo "### [$URL]($URL)";
             echo "";
@@ -189,8 +172,7 @@ jobs:
             echo "4. 如果有 Authorize 页面，点 **Authorize**";
             echo "5. 等待跳回 vps8 的 dashboard";
             echo "";
-            echo "**进入 dashboard 后**，脚本会自动导出 session 并更新 Secret（约 30 秒）。";
-            echo "看到 workflow 结束就算成功。";
+            echo "**进入 dashboard 后**，脚本会自动导出 session 并更新 Secret（约 10 秒）。";
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start Chrome and wait for login
