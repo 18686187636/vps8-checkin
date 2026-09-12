@@ -1,11 +1,4 @@
-"""DrissionPage 浏览器封装：GitHub OAuth 登录 + reCAPTCHA 语音识别 + 截图。
 
-reCAPTCHA 语音识别逻辑参考 HAX VPS 脚本：
-    1. 遍历所有 frame 找 anchor/bframe（URL 里含 "recaptcha" + keyword）
-    2. 鼠标移动到 checkbox → 点击
-    3. 切到音频模式 → 拿音频 URL → 下载
-    4. Google Speech 识别 → 填入 → 验证
-"""
 
 from __future__ import annotations
 
