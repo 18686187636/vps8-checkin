@@ -1,8 +1,8 @@
-"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + Turnstile 处理 + 截图。
+"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + NoneCap 扩展 + 截图。
 
 约定：
 - 不开 --headless，Github Actions 上靠 xvfb-run 提供虚拟显示
-- 截图统一保存到项目根目录的 screenshots/ 下
+- 若设置 NONECAP_EXT_PATH，启动 Chrome 时加载 NoneCap 扩展自动解决 hCaptcha
 - 登录方式：注入 GitHub session cookies → 点 GitHub OAuth → 静默登录 vps8
 """
 
@@ -12,7 +12,6 @@ import base64
 import json
 import os
 import platform
-import random
 import re
 import subprocess
 import time
@@ -27,6 +26,7 @@ SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 GITHUB_SESSION_ENV = "VPS8_GITHUB_SESSION_B64"
 PROXY_ENV = "VPS8_PROXY"
+NONECAP_EXT_ENV = "NONECAP_EXT_PATH"
 
 VPS8_BASE = "https://vps8.zz.cd"
 VPS8_LOGIN_URL = f"{VPS8_BASE}/login"
@@ -68,65 +68,26 @@ _SAMESITE_MAP = {
     "": "Lax",
 }
 
-HAS_TURNSTILE_IFRAME_JS = r"""
-return Array.from(document.querySelectorAll('iframe')).some((frame) => {
-  const src = frame.getAttribute('src') || '';
-  const title = frame.getAttribute('title') || '';
-  return src.includes('challenges.cloudflare.com')
-    || title.toLowerCase().includes('cloudflare')
-    || title.toLowerCase().includes('challenge');
-});
+HAS_HCAPTCHA_JS = r"""
+return !!document.querySelector(
+  '.h-captcha, iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha-assets"]'
+);
 """
 
-LOCATE_TURNSTILE_WIDGET_JS = r"""
-const isVisible = (el) => {
-  if (!el) return false;
-  const rect = el.getBoundingClientRect();
-  if (rect.width < 10 || rect.height < 10) return false;
-  const style = window.getComputedStyle(el);
-  return style.display !== 'none' && style.visibility !== 'hidden';
-};
-const isTurnstileFrame = (frame) => {
-  const src = frame.getAttribute('src') || '';
-  const title = frame.getAttribute('title') || '';
-  return src.includes('challenges.cloudflare.com')
-    || title.toLowerCase().includes('cloudflare')
-    || title.toLowerCase().includes('challenge');
-};
-let target = null;
-let source = '';
-const containerIframes = document.querySelectorAll('.cf-turnstile iframe, [data-sitekey] iframe');
-for (const f of containerIframes) {
-  if (isVisible(f)) { target = f; source = 'container-iframe'; break; }
-}
-if (!target) {
-  const frames = Array.from(document.querySelectorAll('iframe'));
-  const cf = frames.find((f) => isTurnstileFrame(f) && isVisible(f));
-  if (cf) { target = cf; source = 'cloudflare-iframe'; }
-}
-if (!target) {
-  const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-  for (const c of containers) {
-    if (isVisible(c)) { target = c; source = 'container'; break; }
-  }
-}
-if (!target) return null;
-const rect = target.getBoundingClientRect();
-return {
-  source, tag: target.tagName.toLowerCase(),
-  cls: target.className ? String(target.className).slice(0, 80) : '',
-  sitekey: (target.closest('[data-sitekey]') || target).getAttribute('data-sitekey') || '',
-  x: rect.x, y: rect.y, width: rect.width, height: rect.height,
-};
+HCAPTCHA_RESPONSE_JS = r"""
+const ta = document.querySelector(
+  'textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]'
+);
+if (!ta) return '';
+return ta.value || '';
 """
 
 
 # ---------------------------------------------------------------------------
-# cookies 读取兼容
+# 兼容不同 DrissionPage 版本的 cookies() API
 # ---------------------------------------------------------------------------
 
 def _all_cookies(page: ChromiumPage) -> list[dict]:
-    """兼容不同 DrissionPage 版本的 cookies() API。"""
     try:
         result = page.cookies(all_domains=True)
         if result:
@@ -135,7 +96,6 @@ def _all_cookies(page: ChromiumPage) -> list[dict]:
         pass
     except Exception as exc:
         print(f"[browser] cookies(all_domains=True) 失败: {exc}")
-
     try:
         return page.cookies() or []
     except Exception as exc:
@@ -256,7 +216,7 @@ def _resolve_user_agent(chrome_path: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 创建页面
+# 创建页面（含 NoneCap 扩展加载）
 # ---------------------------------------------------------------------------
 
 def create_page() -> ChromiumPage:
@@ -266,7 +226,6 @@ def create_page() -> ChromiumPage:
     co.set_argument("--disable-dev-shm-usage")
     co.set_argument("--disable-gpu")
     co.set_argument("--disable-infobars")
-    co.set_argument("--disable-extensions")
     co.set_argument("--lang=zh-CN,zh;q=0.9,en;q=0.8")
     co.set_argument("--window-size=1280,800")
     co.set_argument("--force-device-scale-factor=1")
@@ -274,6 +233,7 @@ def create_page() -> ChromiumPage:
     co.set_pref("credentials_enable_service", False)
     co.set_pref("profile.password_manager_enabled", False)
 
+    # ---- 代理 ----
     proxy = os.environ.get(PROXY_ENV, "").strip()
     if proxy:
         print(f"[browser] 使用代理: {proxy}")
@@ -283,6 +243,23 @@ def create_page() -> ChromiumPage:
             print(f"[browser] 设置代理失败: {exc}")
     else:
         print("[browser] 未配置代理，直连")
+
+    # ---- NoneCap 扩展 ----
+    ext_path = os.environ.get(NONECAP_EXT_ENV, "").strip()
+    if ext_path and os.path.isdir(ext_path):
+        print(f"[browser] 加载 NoneCap 扩展: {ext_path}")
+        # 关键：必须同时设置这两个启动参数，扩展才能在自动化环境中生效
+        co.set_argument("--enable-extensions")
+        co.set_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
+        # 某些 Chrome 版本还需要显式允许扩展路径
+        co.set_argument(f"--extensions-load-path={ext_path}")
+        try:
+            co.add_extension(ext_path)
+            print("[browser] add_extension 调用完成")
+        except Exception as exc:
+            print(f"[browser] 加载扩展失败: {exc}")
+    else:
+        print("[browser] 未配置 NoneCap 扩展路径，跳过")
 
     co.auto_port()
 
@@ -296,7 +273,19 @@ def create_page() -> ChromiumPage:
         co.set_user_agent(user_agent)
         print(f"[browser] 使用 User-Agent: {user_agent}")
 
-    return ChromiumPage(co)
+    page = ChromiumPage(co)
+
+    # 验证扩展是否加载
+    if ext_path:
+        try:
+            exts = page.run_cdp("Browser.getExtensions")
+            print(f"[browser] 浏览器已加载扩展: {len(exts)} 个")
+            for e in exts:
+                print(f"[browser]   - {e.get('name', 'unknown')}")
+        except Exception as exc:
+            print(f"[browser] 获取扩展列表失败: {exc}")
+
+    return page
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +301,12 @@ def _dump_github_cookies(page: ChromiumPage) -> None:
 
 
 def inject_github_session(page: ChromiumPage, cookies: list[dict]) -> None:
-    """把 GitHub session cookies 注入浏览器。"""
     print(f"[browser] 访问 {GITHUB_BASE} 以准备注入 GitHub cookies")
     try:
         page.get(GITHUB_BASE)
         time.sleep(2)
     except Exception as exc:
         print(f"[browser] 访问 GitHub 失败: {exc}")
-
     try:
         page.set.cookies(cookies, set_domain=True)
     except TypeError:
@@ -329,7 +316,6 @@ def inject_github_session(page: ChromiumPage, cookies: list[dict]) -> None:
 
 
 def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
-    """访问 vps8 登录页，点 GitHub 按钮，等待 OAuth 跳回 vps8 的 dashboard。"""
     print(f"[browser] 打开 vps8 登录页: {VPS8_LOGIN_URL}")
     page.get(VPS8_LOGIN_URL)
     time.sleep(2.5)
@@ -367,7 +353,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
             url = page.url
         except Exception:
             url = ""
-
         if url and url != last_url:
             print(f"[browser] URL: {url}")
             last_url = url
@@ -399,6 +384,67 @@ def login_via_github(page: ChromiumPage, timeout: int = 90) -> None:
 
 
 # ---------------------------------------------------------------------------
+# hCaptcha（由 NoneCap 扩展自动处理）
+# ---------------------------------------------------------------------------
+
+def _has_hcaptcha_widget(page: ChromiumPage) -> bool:
+    try:
+        return bool(page.run_js(HAS_HCAPTCHA_JS))
+    except Exception:
+        return False
+
+
+def _hcaptcha_response(page: ChromiumPage) -> str:
+    try:
+        token = page.run_js(HCAPTCHA_RESPONSE_JS)
+        return token or ""
+    except Exception:
+        return ""
+
+
+def wait_hcaptcha_solved(page: ChromiumPage, timeout: int = 180) -> bool:
+    """等待 NoneCap 扩展自动解决 hCaptcha。
+
+    NoneCap 会在后台检测 widget、截图挑战区域、调用 API 获取答案，
+    然后用类人光标点击。整个过程通常 5-30 秒。
+    我们只需要轮询 textarea[name="h-captcha-response"] 是否被填充。
+    """
+    if not _has_hcaptcha_widget(page):
+        print("[hcaptcha] 未检测到 hCaptcha widget，跳过")
+        return True
+
+    print("[hcaptcha] 检测到 hCaptcha widget，等待 NoneCap 扩展自动解决...")
+
+    # 先看是否已经有 token（可能已经自动通过了）
+    if _hcaptcha_response(page):
+        print("[hcaptcha] 已存在 response token")
+        return True
+
+    deadline = time.time() + timeout
+    last_report = 0
+
+    while time.time() < deadline:
+        if _hcaptcha_response(page):
+            elapsed = int(timeout - (deadline - time.time()))
+            print(f"[hcaptcha] ✅ NoneCap 已解决（耗时约 {elapsed}s）")
+            time.sleep(1)
+            return True
+
+        # 每 15 秒报告一次进度
+        now = time.time()
+        if now - last_report >= 15:
+            remaining = int(deadline - now)
+            print(f"[hcaptcha] 仍在等待... 剩余 {remaining}s")
+            last_report = now
+
+        time.sleep(1)
+
+    print(f"[hcaptcha] ❌ {timeout}s 内未解决，可能扩展未加载或额度用完")
+    screenshot(page, "03c-hcaptcha-timeout")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # 截图
 # ---------------------------------------------------------------------------
 
@@ -424,139 +470,6 @@ def screenshot(page: ChromiumPage, name: str, full_page: bool = False) -> Option
     except Exception as exc:
         print(f"[browser] 截图失败 ({name}): {exc}")
         return None
-
-
-# ---------------------------------------------------------------------------
-# Turnstile
-# ---------------------------------------------------------------------------
-
-def _has_turnstile_widget(page: ChromiumPage) -> bool:
-    try:
-        return bool(page.run_js("return !!document.querySelector('.cf-turnstile, [data-sitekey]');")) \
-            or bool(page.run_js(HAS_TURNSTILE_IFRAME_JS))
-    except Exception:
-        return False
-
-
-def wait_turnstile_widget(page: ChromiumPage, timeout: int = 30) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _has_turnstile_widget(page):
-            return True
-        time.sleep(0.4)
-    return False
-
-
-def solve_turnstile(
-    page: ChromiumPage,
-    timeout: int = 30,
-    poll_interval: float = 1.5,
-    require_iframe: bool = True,
-) -> bool:
-    if require_iframe and not wait_turnstile_widget(page, timeout=min(timeout, 20)):
-        print("[turnstile] 未检测到 Turnstile widget")
-        return False
-
-    try:
-        info = page.run_js(LOCATE_TURNSTILE_WIDGET_JS)
-        if info:
-            print(
-                "[turnstile] 定位到 widget: "
-                f"source={info.get('source')}, "
-                f"pos=({info.get('x'):.0f},{info.get('y'):.0f}), "
-                f"size=({info.get('width'):.0f}x{info.get('height'):.0f})"
-            )
-    except Exception as exc:
-        print(f"[turnstile] 读取 widget 信息失败: {exc}")
-
-    if _turnstile_token(page):
-        print("[turnstile] 已存在 response token")
-        return True
-
-    deadline = time.time() + timeout
-    attempts = 0
-    while time.time() < deadline:
-        attempts += 1
-        clicked = _click_turnstile_checkbox(page)
-        print(f"[turnstile] 第 {attempts} 次尝试点击: {'成功' if clicked else '失败'}")
-        if _wait_for_pass(page, timeout=8):
-            time.sleep(1.5)
-            print(f"[turnstile] 盾通过 (尝试 {attempts} 次)")
-            return True
-        time.sleep(poll_interval)
-
-    print(f"[turnstile] {timeout}s 内未通过")
-    return False
-
-
-def _click_turnstile_checkbox(page: ChromiumPage) -> bool:
-    try:
-        info = page.run_js(LOCATE_TURNSTILE_WIDGET_JS)
-    except Exception:
-        return False
-    if not info:
-        return False
-
-    width = float(info.get("width") or 0)
-    height = float(info.get("height") or 0)
-    if width < 30 or height < 20:
-        return False
-
-    try:
-        page.run_js(
-            "const t = document.querySelector('.cf-turnstile, [data-sitekey]'); "
-            "if (t) t.scrollIntoView({block: 'center', inline: 'center'});"
-        )
-        time.sleep(0.3)
-        info = page.run_js(LOCATE_TURNSTILE_WIDGET_JS) or info
-    except Exception:
-        pass
-
-    base_x = float(info["x"]) + 28
-    base_y = float(info["y"]) + float(info["height"]) / 2
-    x = int(base_x + random.randint(-3, 3))
-    y = int(base_y + random.randint(-3, 3))
-
-    try:
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x - 15, y=y - 5)
-        time.sleep(random.uniform(0.15, 0.3))
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
-        time.sleep(random.uniform(0.2, 0.4))
-        page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
-                     x=x, y=y, button="left", clickCount=1)
-        time.sleep(random.uniform(0.08, 0.18))
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
-                     x=x, y=y, button="left", clickCount=1)
-        print(f"[turnstile] 已在 ({x},{y}) 模拟点击")
-        return True
-    except Exception as exc:
-        print(f"[turnstile] CDP 点击失败: {exc}")
-        return False
-
-
-def _turnstile_token(page: ChromiumPage) -> str:
-    try:
-        token = page.run_js(r"""
-            const inputs = document.querySelectorAll(
-              'input[name="cf-turnstile-response"], input[name^="cf-chl-widget"]'
-            );
-            for (const el of inputs) {
-              if (el.value) return el.value;
-            }
-            return '';
-        """)
-        return token or ""
-    except Exception:
-        return ""
-
-
-def _wait_for_pass(page: ChromiumPage, timeout: int = 20) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _turnstile_token(page):
-            return True
-        time.sleep(0.5)
-    return False
 
 
 def safe_close(page: Optional[ChromiumPage]) -> None:
