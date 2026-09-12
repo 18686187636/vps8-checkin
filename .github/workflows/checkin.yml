@@ -29,9 +29,6 @@ jobs:
           echo ""
           echo "===== browser.py 关键函数签名 ====="
           grep -n "def create_page\|def apply_cookies\|def _inject_cookies" src/browser.py || echo "无匹配"
-          echo ""
-          echo "===== browser.py 是否真的调用了 _inject_cookies ====="
-          grep -n "_inject_cookies(page" src/browser.py || echo "无匹配"
 
       - name: Compute Beijing date
         id: bjdate
@@ -67,44 +64,63 @@ jobs:
           import base64, json, os
           raw = os.environ.get("VPS8_STORAGE_STATE_B64", "")
           print(f"VPS8_STORAGE_STATE_B64 长度: {len(raw)}")
-          if not raw:
-              print("::error::Secret 为空")
-              raise SystemExit(1)
-          try:
-              cookies = json.loads(base64.b64decode(raw).decode())
-          except Exception as e:
-              print(f"::error::解码失败: {e}")
-              raise SystemExit(1)
+          cookies = json.loads(base64.b64decode(raw).decode())
           if isinstance(cookies, dict):
               cookies = cookies.get("cookies", [])
           php = next((c for c in cookies if c["name"] == "PHPSESSID"), None)
           if not php:
               print("::error::找不到 PHPSESSID")
               raise SystemExit(1)
-          with open("/tmp/php.txt", "w") as f:
-              f.write(php["value"])
+          open("/tmp/php.txt", "w").write(php["value"])
           print(f"PHPSESSID = {php['value']}")
-          print(f"cookies 数量: {len(cookies)}")
           PY
 
           PHP=$(cat /tmp/php.txt)
-          echo ""
-          echo "===== curl /dashboard ====="
-          curl -s -i -o /tmp/resp.txt \
-            -H "Cookie: PHPSESSID=$PHP" \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36" \
-            "https://vps8.zz.cd/dashboard"
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 
-          echo "HTTP 状态行:"
-          head -1 /tmp/resp.txt
           echo ""
-          echo "===== 响应前 30 行 ====="
-          head -30 /tmp/resp.txt
+          echo "===== [1] 第一次请求 /dashboard（带 PHPSESSID）====="
+          curl -s -i -c /tmp/jar.txt -o /tmp/r1.txt \
+            -H "Cookie: PHPSESSID=$PHP" \
+            -H "User-Agent: $UA" \
+            "https://vps8.zz.cd/dashboard"
+          echo "状态行: $(head -1 /tmp/r1.txt)"
+          echo "响应 set-cookie:"
+          grep -i "^set-cookie" /tmp/r1.txt || echo "  (无)"
+          echo "响应前 15 行:"
+          head -15 /tmp/r1.txt
+
           echo ""
-          if grep -q "/login" /tmp/resp.txt; then
-            echo "::warning::cookie 可能已失效（响应里出现 /login）"
+          echo "===== [2] 第二次请求 /dashboard（带 jar）====="
+          curl -s -i -b /tmp/jar.txt -o /tmp/r2.txt \
+            -H "User-Agent: $UA" \
+            "https://vps8.zz.cd/dashboard"
+          echo "状态行: $(head -1 /tmp/r2.txt)"
+          echo "响应前 30 行:"
+          head -30 /tmp/r2.txt
+
+          echo ""
+          echo "===== [3] 第三次请求 /（首页）====="
+          curl -s -i -b /tmp/jar.txt -c /tmp/jar.txt -o /tmp/r3.txt \
+            -H "User-Agent: $UA" \
+            "https://vps8.zz.cd/"
+          echo "状态行: $(head -1 /tmp/r3.txt)"
+
+          echo ""
+          echo "===== [4] 再用 jar 请求 /points/signin（签到页）====="
+          curl -s -i -b /tmp/jar.txt -o /tmp/r4.txt \
+            -H "User-Agent: $UA" \
+            "https://vps8.zz.cd/points/signin"
+          echo "状态行: $(head -1 /tmp/r4.txt)"
+          echo "响应前 20 行:"
+          head -20 /tmp/r4.txt
+
+          echo ""
+          echo "===== 结论 ====="
+          if grep -q "login" /tmp/r4.txt; then
+            echo "::warning::即使模拟两次请求，最终仍被引导到 login（cookie 可能真失效）"
           else
-            echo "cookie 看起来有效（响应里没有 /login）"
+            echo "服务端接受该 session（cookie 有效）"
           fi
 
       - name: Run checkin
