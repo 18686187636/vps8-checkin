@@ -62,6 +62,45 @@ if (!ta) return '';
 return ta.value || '';
 """
 
+# ---- 供 _cdp_click_element 使用的表达式（IIFE，无末尾分号）----
+
+FIND_GITHUB_LOGIN_BTN_JS = r"""
+(() => {
+  const isVisible = (el) => {
+    const s = window.getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden'
+      && r.width > 0 && r.height > 0;
+  };
+  const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+  return candidates.find((el) => {
+    if (!isVisible(el)) return false;
+    const href = (el.getAttribute('href') || '').toLowerCase();
+    const text = (el.innerText || el.textContent || '').toLowerCase();
+    return href.includes('/github/login') || text.includes('github');
+  }) || null;
+})()
+"""
+
+FIND_AUTHORIZE_BTN_JS = r"""
+(() => {
+  const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+  return btns.find(b => {
+    const name = (b.getAttribute('name') || '').toLowerCase();
+    const val = (b.getAttribute('value') || '').toLowerCase();
+    const text = (b.innerText || b.textContent || b.value || '').toLowerCase();
+    if (name === 'cancel' || val === 'cancel') return false;
+    if (text === 'cancel' || text.includes('cancel')) return false;
+    if (text.includes('deny') || text.includes('go back') || text.includes('back to'))
+      return false;
+    return (name === 'authorize' && val === '1')
+      || name === 'authorize'
+      || val === 'authorize'
+      || text.includes('authorize');
+  }) || null;
+})()
+"""
+
 
 # ---------------------------------------------------------------------------
 # cookies
@@ -248,24 +287,28 @@ def create_page() -> ChromiumPage:
 
 
 # ---------------------------------------------------------------------------
-# CDP 真实鼠标点击（防止 GitHub 检测为自动化）
+# CDP 真实鼠标点击
 # ---------------------------------------------------------------------------
 
-def _cdp_click_element(page: ChromiumPage, find_element_js: str) -> bool:
-    """在页面中找到元素的中心坐标，用 CDP 派发真实鼠标事件点击。
+def _cdp_click_element(page: ChromiumPage, find_element_expr: str) -> bool:
+    """find_element_expr 必须是**表达式**（返回 DOM 元素或 null）。
 
-    find_element_js 需要返回一个 DOM 元素，例如 "document.querySelector('#x')"。
+    不要传多语句代码块；多语句请自行包成 IIFE: (() => {...})()
     """
-    get_rect_js = f"""
-    const el = {find_element_js};
-    if (!el) return null;
-    el.scrollIntoView({{block: 'center', inline: 'center'}});
-    const r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) return null;
-    return {{x: r.x + r.width / 2, y: r.y + r.height / 2}};
-    """
+    # 用 IIFE 包成函数体，避免拼接语法错误
+    js = (
+        "(function() {"
+        f"  const el = {find_element_expr};"
+        "  if (!el) return null;"
+        "  el.scrollIntoView({block: 'center', inline: 'center'});"
+        "  const r = el.getBoundingClientRect();"
+        "  if (r.width < 1 || r.height < 1) return null;"
+        "  return {x: r.x + r.width / 2, y: r.y + r.height / 2};"
+        "})()"
+    )
+
     try:
-        rect = page.run_js(get_rect_js)
+        rect = page.run_js(js)
     except Exception as exc:
         print(f"[browser] 获取元素坐标失败: {exc}")
         return False
@@ -277,7 +320,6 @@ def _cdp_click_element(page: ChromiumPage, find_element_js: str) -> bool:
     y = int(rect["y"])
 
     try:
-        # 分步移动，模拟人的鼠标轨迹
         page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x - 40, y=y - 15)
         time.sleep(0.15)
         page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x - 15, y=y - 5)
@@ -301,22 +343,24 @@ def _cdp_click_element(page: ChromiumPage, find_element_js: str) -> bool:
 
 
 def _dump_buttons(page: ChromiumPage) -> None:
-    """打印页面上所有按钮信息，用于排查。"""
     js = r"""
-    const btns = Array.from(document.querySelectorAll(
-      'button, input[type="submit"], a[role="button"]'
-    ));
-    return btns.map(b => ({
-        tag: b.tagName.toLowerCase(),
-        name: b.getAttribute('name') || '',
-        value: b.getAttribute('value') || '',
-        text: (b.innerText || b.textContent || b.value || '').trim().slice(0, 80),
-        visible: (() => {
-            const s = window.getComputedStyle(b);
-            const r = b.getBoundingClientRect();
-            return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-        })(),
-    }));
+    (() => {
+      const btns = Array.from(document.querySelectorAll(
+        'button, input[type="submit"], a[role="button"]'
+      ));
+      return btns.map(b => ({
+          tag: b.tagName.toLowerCase(),
+          name: b.getAttribute('name') || '',
+          value: b.getAttribute('value') || '',
+          text: (b.innerText || b.textContent || b.value || '').trim().slice(0, 80),
+          visible: (() => {
+              const s = window.getComputedStyle(b);
+              const r = b.getBoundingClientRect();
+              return s.display !== 'none' && s.visibility !== 'hidden'
+                  && r.width > 0 && r.height > 0;
+          })(),
+      }));
+    })()
     """
     try:
         btns = page.run_js(js) or []
@@ -357,67 +401,12 @@ def inject_github_session(page: ChromiumPage, cookies: list[dict]) -> None:
     _dump_github_cookies(page)
 
 
-# Authorize 按钮的定位 JS：返回一个 DOM 元素
-_AUTHORIZE_BUTTON_JS = r"""
-(() => {
-    const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-    return btns.find(b => {
-        const name = (b.getAttribute('name') || '').toLowerCase();
-        const val = (b.getAttribute('value') || '').toLowerCase();
-        const text = (b.innerText || b.textContent || b.value || '').toLowerCase();
-        // 排除 Cancel / Deny / Go back
-        if (name === 'cancel' || val === 'cancel') return false;
-        if (text === 'cancel' || text.includes('cancel'))
-            return false;
-        if (text.includes('deny') || text.includes('go back') || text.includes('back to'))
-            return false;
-        // 命中 Authorize
-        return (name === 'authorize' && val === '1')
-            || name === 'authorize'
-            || val === 'authorize'
-            || text.includes('authorize');
-    }) || null;
-})()
-"""
-
-
-def _click_authorize_button(page: ChromiumPage) -> bool:
-    """用 CDP 真实鼠标点击 GitHub 授权页的 Authorize 按钮。"""
-    # 先检查有没有这样的按钮
-    try:
-        exists = page.run_js(f"return !!({_AUTHORIZE_BUTTON_JS});")
-    except Exception:
-        exists = False
-
-    if not exists:
-        print("[browser] 未找到 Authorize 按钮")
-        return False
-
-    # 用 CDP 点击
-    return _cdp_click_element(page, _AUTHORIZE_BUTTON_JS)
-
-
 def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
     print(f"[browser] 打开 vps8 登录页: {VPS8_LOGIN_URL}")
     page.get(VPS8_LOGIN_URL)
     time.sleep(2.5)
 
-    # 点击 GitHub 登录按钮
-    click_github_js = r"""
-    const isVisible = (el) => {
-      const s = window.getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-    };
-    const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-    return candidates.find((el) => {
-      if (!isVisible(el)) return false;
-      const href = (el.getAttribute('href') || '').toLowerCase();
-      const text = (el.innerText || el.textContent || '').toLowerCase();
-      return href.includes('/github/login') || text.includes('github');
-    }) || null;
-    """
-    if not _cdp_click_element(page, click_github_js):
+    if not _cdp_click_element(page, FIND_GITHUB_LOGIN_BTN_JS):
         screenshot(page, "10-no-github-button")
         raise RuntimeError("找不到 GitHub 登录按钮")
 
@@ -437,7 +426,7 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
             print(f"[browser] URL: {url}")
             last_url = url
 
-        # access_denied：返回重试
+        # access_denied → 重试
         if "access_denied" in url or "error=access_denied" in url:
             authorize_attempts += 1
             print(f"[browser] ⚠️ access_denied（第 {authorize_attempts} 次）")
@@ -450,17 +439,17 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
             print("[browser] 返回登录页重试...")
             page.get(VPS8_LOGIN_URL)
             time.sleep(2.5)
-            if not _cdp_click_element(page, click_github_js):
+            if not _cdp_click_element(page, FIND_GITHUB_LOGIN_BTN_JS):
                 raise RuntimeError("重试时找不到 GitHub 登录按钮")
             time.sleep(3)
             continue
 
-        # GitHub 授权页：dump 按钮 + CDP 点击 Authorize
+        # GitHub 授权页
         if "github.com" in url and ("/login/oauth/authorize" in url or "/oauth/authorize" in url):
             print("[browser] 检测到 GitHub 授权页，dump 按钮信息")
             _dump_buttons(page)
 
-            if _click_authorize_button(page):
+            if _cdp_click_element(page, FIND_AUTHORIZE_BTN_JS):
                 print("[browser] 已点击 Authorize 按钮（CDP）")
                 time.sleep(3)
                 continue
