@@ -49,14 +49,45 @@ jobs:
           mkdir -p extensions
           cd extensions
 
-          # 尝试多个镜像下载最新 release
-          NONE_CAP_URL="https://github.com/nonecap/nonecap-extension/releases/latest/download/nonecap-extension.zip"
+          # 用 GitHub API 动态获取最新 Release 的资产下载链接
+          echo "获取 NoneCap 最新 Release 信息..."
+          RELEASE_JSON=$(curl -s "https://api.github.com/repos/nonecap/nonecap-extension/releases/latest")
 
+          # 提取第一个 zip 资产的下载 URL（浏览器兼容版本）
+          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assets = data.get('assets', [])
+          # 优先匹配浏览器版本的 zip
+          for a in assets:
+              name = a['name'].lower()
+              if name.endswith('.zip') and 'chrome' in name:
+                  print(a['browser_download_url'])
+                  sys.exit(0)
+          # 退而求其次：任何 zip
+          for a in assets:
+              if a['name'].endswith('.zip'):
+                  print(a['browser_download_url'])
+                  sys.exit(0)
+          print('')
+          ")
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "❌ 未能从 GitHub API 获取 NoneCap 下载链接"
+            echo "Release 资产列表："
+            echo "$RELEASE_JSON" | python3 -m json.tool | head -80
+            echo "nonecap_ready=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "下载地址: $DOWNLOAD_URL"
+
+          # 用多个镜像尝试下载
           download_ok=0
           for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
-            echo "尝试: ${PREFIX}${NONE_CAP_URL}"
+            echo "尝试: ${PREFIX}${DOWNLOAD_URL}"
             if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 120 \
-                 -o nonecap.zip "${PREFIX}${NONE_CAP_URL}"; then
+                 -o nonecap.zip "${PREFIX}${DOWNLOAD_URL}"; then
               if file nonecap.zip | grep -q 'Zip archive'; then
                 echo "✅ 下载成功 (${PREFIX:-direct})"
                 download_ok=1
@@ -69,16 +100,16 @@ jobs:
           done
 
           if [ "$download_ok" != "1" ]; then
-            echo "❌ NoneCap 下载失败，将跳过扩展加载"
+            echo "❌ NoneCap 所有下载源均失败"
             echo "nonecap_ready=false" >> "$GITHUB_ENV"
             exit 0
           fi
 
           unzip -o nonecap.zip -d nonecap
-          # 找到 manifest.json 所在目录（zip 可能有一层子目录）
           MANIFEST_DIR=$(dirname "$(find ./nonecap -name "manifest.json" | head -1)")
-          if [ -z "$MANIFEST_DIR" ]; then
+          if [ -z "$MANIFEST_DIR" ] || [ ! -d "$MANIFEST_DIR" ]; then
             echo "❌ 未找到 manifest.json"
+            find ./nonecap -type f | head -20
             echo "nonecap_ready=false" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -98,11 +129,15 @@ jobs:
           EOF
             echo "✅ 已生成 provision.json（含 API Key）"
           else
-            cp "$MANIFEST_DIR/provision.example.json" "$MANIFEST_DIR/provision.json" 2>/dev/null || true
-            echo "ℹ️ 未配置 NONE_CAP_KEY，使用免费额度（每天 100 次）"
+            # 没有 API Key 时使用示例文件
+            if [ -f "$MANIFEST_DIR/provision.example.json" ]; then
+              cp "$MANIFEST_DIR/provision.example.json" "$MANIFEST_DIR/provision.json"
+              echo "ℹ️ 使用 provision.example.json（免费额度：每天 100 次）"
+            else
+              echo "ℹ️ 未找到 provision.example.json，使用默认配置（免费额度）"
+            fi
           fi
 
-          # 输出扩展绝对路径供后续步骤使用
           echo "NONECAP_EXT_PATH=$(realpath "$MANIFEST_DIR")" >> "$GITHUB_ENV"
           echo "nonecap_ready=true" >> "$GITHUB_ENV"
           echo "✅ NoneCap 扩展准备完成"
@@ -118,6 +153,8 @@ jobs:
           co.set_argument("--no-sandbox")
           co.set_argument("--disable-dev-shm-usage")
           co.set_argument("--disable-gpu")
+          co.set_argument("--enable-extensions")
+          co.set_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
           co.add_extension(os.environ["NONECAP_EXT_PATH"])
           page = ChromiumPage(co)
           page.get("about:blank")
