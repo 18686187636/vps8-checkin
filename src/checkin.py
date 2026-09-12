@@ -2,7 +2,7 @@
 
 流程：
     1. GitHub OAuth 静默登录 vps8
-    2. 进入签到页
+    2. 进入签到页，检查是否是真正的签到页
     3. 等待验证码 widget（最长 120 秒）
     4. reCAPTCHA → 音频识别（失败回退 2captcha）
     5. 提交签到表单
@@ -50,6 +50,10 @@ class CheckinNotConfirmed(Exception):
     pass
 
 
+class NotOnCheckinPage(Exception):
+    pass
+
+
 def _visible_page_text(page) -> str:
     try:
         text = page.run_js("return document.body ? document.body.innerText : '';")
@@ -74,6 +78,45 @@ def _is_already_checked_in(page) -> bool:
     ):
         return True
     return False
+
+
+def _dump_page_state(page, tag: str = "") -> None:
+    """dump 页面状态，方便定位问题。"""
+    prefix = f"[checkin-dump{(' ' + tag) if tag else ''}]"
+    try:
+        info = page.run_js(r"""
+        (() => {
+          const bodyText = (document.body && document.body.innerText) || '';
+          return JSON.stringify({
+            url: location.href,
+            title: document.title,
+            readyState: document.readyState,
+            bodyTextLen: bodyText.length,
+            bodyTextHead: bodyText.slice(0, 800),
+            hasSigninForm: !!document.querySelector('#points-signin-form'),
+            hasSigninBtn: !!document.querySelector('#points-signin-submit'),
+            hasRecaptchaDiv: !!document.querySelector('.g-recaptcha'),
+            hasRecaptchaIframe: !!document.querySelector('iframe[src*="recaptcha"]'),
+            hasLoginForm: !!document.querySelector('form[action*="login"], input[name="email"], input[name="password"]'),
+            h1Text: (document.querySelector('h1,h2,h3') || {}).innerText || '',
+            iframeCount: document.querySelectorAll('iframe').length,
+          });
+        })()
+        """)
+        if not info:
+            print(f"{prefix} 无数据")
+            return
+        import json as _json
+        data = _json.loads(info) if isinstance(info, str) else info
+        print(f"{prefix} URL: {data.get('url')}")
+        print(f"{prefix} title: {data.get('title')!r}  h1: {data.get('h1Text')!r}")
+        print(f"{prefix} readyState={data.get('readyState')}  bodyTextLen={data.get('bodyTextLen')}")
+        print(f"{prefix} hasSigninForm={data.get('hasSigninForm')}  hasSigninBtn={data.get('hasSigninBtn')}")
+        print(f"{prefix} hasRecaptchaDiv={data.get('hasRecaptchaDiv')}  hasRecaptchaIframe={data.get('hasRecaptchaIframe')}")
+        print(f"{prefix} hasLoginForm={data.get('hasLoginForm')}  iframeCount={data.get('iframeCount')}")
+        print(f"{prefix} bodyText 前 800 字：\n{data.get('bodyTextHead')}")
+    except Exception as exc:
+        print(f"{prefix} dump 失败: {exc}")
 
 
 def _click_checkin_action(page) -> bool:
@@ -122,10 +165,59 @@ def _confirm_checkin_success(page, timeout: int = 30) -> bool:
     return False
 
 
+def _verify_on_checkin_page(page, timeout: int = 15) -> None:
+    """确认当前确实是签到页，否则 dump 并报错。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ok = page.run_js(r"""
+                return !!(
+                    document.querySelector('#points-signin-form')
+                    || document.querySelector('#points-signin-submit')
+                    || document.querySelector('.g-recaptcha')
+                    || document.querySelector('.h-captcha')
+                    || document.querySelector('.cf-turnstile')
+                );
+            """)
+        except Exception:
+            ok = False
+
+        if ok:
+            print("[checkin] ✅ 已进入真正的签到页")
+            return
+
+        # 如果页面里出现「今日签到状态」字样也算签到页
+        text = _visible_page_text(page)
+        if "今日签到状态" in text or "积分签到" in text:
+            print("[checkin] ✅ 已进入签到页（通过文本判断）")
+            return
+
+        time.sleep(1)
+
+    # 没找到关键元素
+    _dump_page_state(page, tag="verify-fail")
+    browser.screenshot(page, "03-not-on-checkin-page")
+
+    text = _visible_page_text(page)
+    if "登录" in text and "密码" in text:
+        raise LoginFailed(f"进入签到页后显示登录页（{page.url}），session 未生效")
+    if "Just a moment" in text or "cloudflare" in text.lower():
+        raise LoginFailed("进入签到页被 Cloudflare 拦截")
+    if len(text) < 500:
+        raise NotOnCheckinPage(f"签到页内容异常（仅 {len(text)} 字符），URL: {page.url}")
+
+    raise NotOnCheckinPage(f"签到页缺少签到表单，URL: {page.url}")
+
+
 def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
     # ===== 1. GitHub OAuth 登录 =====
     browser.inject_github_session(page, github_cookies)
     browser.login_via_github(page, timeout=120)
+
+    # 登录后再访问一次 dashboard 确认
+    if not browser.is_logged_in(page):
+        _dump_page_state(page, tag="after-oauth")
+        raise LoginFailed("OAuth 完成但无法确认登录状态")
 
     # ===== 2. 进入签到页 =====
     print(f"[checkin] 访问签到页: {CHECKIN_URL}")
@@ -139,7 +231,10 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
     print(f"[checkin] 签到页 URL: {page.url}")
     browser.screenshot(page, "03-checkin-page")
 
-    time.sleep(3)
+    # ===== 2.5 确认进入真正的签到页 =====
+    _verify_on_checkin_page(page, timeout=15)
+
+    time.sleep(2)
 
     if _is_already_checked_in(page):
         print("[checkin] 今日已签到（服务端确认）")
@@ -147,7 +242,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    # ===== 3. 等验证码 widget 渲染（120 秒）=====
+    # ===== 3. 等验证码 widget 渲染 =====
     print("[checkin] 等待验证码 widget 渲染（最多 120 秒）...")
     captcha_info = browser.wait_captcha_widget(page, timeout=120)
     print(f"[checkin] 检测到的验证码: {captcha_info}")
@@ -164,7 +259,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
         else:
             print("[checkin] 音频识别失败，将回退 2captcha")
     elif ctype == "none":
-        print("[checkin] ⚠️ 未检测到验证码 widget，先刷新页面再等一轮")
+        print("[checkin] ⚠️ 未检测到验证码 widget，刷新后再等一轮")
         page.refresh()
         time.sleep(5)
         browser.screenshot(page, "03c-refresh-retry")
@@ -185,7 +280,8 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
             if browser.solve_recaptcha_via_audio(page, timeout=120):
                 captcha_solved = True
         elif ctype == "none":
-            print("[checkin] 仍未检测到验证码，按无验证码直接提交")
+            print("[checkin] 两轮都没检测到验证码，dump 页面并尝试直接提交")
+            _dump_page_state(page, tag="captcha-none")
             captcha_solved = True
     else:
         print(f"[checkin] 验证码类型 {ctype}，需要用 2captcha")
@@ -217,6 +313,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
             browser.screenshot(page, "05-success")
             return "本日已签到"
         browser.screenshot(page, "03g-no-button")
+        _dump_page_state(page, tag="no-button")
         raise CheckinElementsNotFound("未找到签到按钮")
 
     print("[checkin] 已点击签到按钮")
@@ -229,6 +326,7 @@ def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
         time.sleep(5)
         if not _confirm_checkin_success(page, timeout=20):
             browser.screenshot(page, "04b-not-confirmed")
+            _dump_page_state(page, tag="not-confirmed")
             raise CheckinNotConfirmed("点击签到后未确认到签到成功状态")
 
     time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
@@ -260,7 +358,7 @@ def main() -> int:
 
     captcha_api_key = os.environ.get("CAPTCHA_API_KEY", "").strip()
     if captcha_api_key:
-        print(f"[env] CAPTCHA_API_KEY: {captcha_api_key[:8]}...（已加载，作为兜底）")
+        print(f"[env] CAPTCHA_API_KEY: {captcha_api_key[:8]}...（已加载）")
     else:
         print("[env] 未配置 CAPTCHA_API_KEY，仅使用音频识别")
 
