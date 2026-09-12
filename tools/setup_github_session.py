@@ -15,7 +15,25 @@ from nacl import encoding, public
 from DrissionPage import ChromiumOptions, ChromiumPage
 
 LOGIN_URL = "https://vps8.zz.cd/login"
-WAIT_TIMEOUT = 25 * 60  # 25 分钟
+WAIT_TIMEOUT = 25 * 60
+
+
+def _all_cookies(page: ChromiumPage) -> list[dict]:
+    """兼容不同 DrissionPage 版本的 cookies() API。"""
+    try:
+        result = page.cookies(all_domains=True)
+        if result:
+            return result
+    except TypeError:
+        pass
+    except Exception as exc:
+        print(f"[setup] cookies(all_domains=True) 失败: {exc}")
+
+    try:
+        return page.cookies() or []
+    except Exception as exc:
+        print(f"[setup] cookies() 失败: {exc}")
+        return []
 
 
 def main() -> int:
@@ -28,10 +46,8 @@ def main() -> int:
     co.set_argument("--window-size=1280,800")
     co.set_argument("--disable-blink-features=AutomationControlled")
 
-    # 显示在有头屏幕（Xvfb）上
     co.headless(False)
 
-    # 代理
     proxy = os.environ.get("VPS8_PROXY", "").strip()
     if proxy:
         print(f"[setup] 使用代理: {proxy}")
@@ -69,8 +85,8 @@ def main() -> int:
             last_url = url
 
         if _is_logged_in(url):
-            print("[setup] 检测到已进入 vps8，等待 3 秒让 session 稳定...")
-            time.sleep(3)
+            print("[setup] 检测到已进入 vps8，等待 5 秒让 session 稳定...")
+            time.sleep(5)
             return _export_and_save(page)
 
         time.sleep(2)
@@ -90,19 +106,23 @@ def _is_logged_in(url: str) -> bool:
 
 
 def _export_and_save(page: ChromiumPage) -> int:
-    all_cookies = page.cookies(as_dict=False)
+    all_cookies = _all_cookies(page)
+    print(f"[setup] 读取到全部 cookie: {len(all_cookies)} 条")
+
     github_cookies = [
         c for c in all_cookies
         if "github.com" in str(c.get("domain") or "").lower()
     ]
 
-    print(f"[setup] 全部 cookie: {len(all_cookies)} 条")
     print(f"[setup] GitHub 域 cookie: {len(github_cookies)} 条")
     for c in github_cookies:
         print(f"[setup]   {c.get('name')} (domain={c.get('domain')})")
 
     if not github_cookies:
         print("[setup] 错误：没有 GitHub cookie，无法导出")
+        print("[setup] 全部 cookie 域名列表：")
+        for c in all_cookies:
+            print(f"[setup]   domain={c.get('domain')} name={c.get('name')}")
         return 1
 
     state = {"cookies": github_cookies, "origins": []}
