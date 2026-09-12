@@ -2,15 +2,16 @@
 
 流程：
     1. GitHub OAuth 静默登录 vps8
-    2. 进入签到页，先直接点一次签到（触发 hCaptcha 重新加载）
-    3. 刷新页面
-    4. 等 hCaptcha widget 渲染出来
-    5. NoneCap 扩展自动解决 hCaptcha
-    6. 点击签到按钮，确认成功
+    2. 进入签到页
+    3. 检测验证码类型
+    4. reCAPTCHA → 优先音频识别；失败回退 2captcha
+       hCaptcha / Turnstile → 直接 2captcha
+    5. 提交签到表单
 """
 
 from __future__ import annotations
 
+import os
 import time
 import traceback
 
@@ -122,7 +123,7 @@ def _confirm_checkin_success(page, timeout: int = 30) -> bool:
     return False
 
 
-def do_checkin(page, github_cookies: list[dict]) -> str:
+def do_checkin(page, github_cookies: list[dict], captcha_api_key: str) -> str:
     # ===== 1. GitHub OAuth 登录 =====
     browser.inject_github_session(page, github_cookies)
     browser.login_via_github(page, timeout=120)
@@ -130,7 +131,7 @@ def do_checkin(page, github_cookies: list[dict]) -> str:
     # ===== 2. 进入签到页 =====
     print(f"[checkin] 访问签到页: {CHECKIN_URL}")
     page.get(CHECKIN_URL)
-    time.sleep(3)
+    time.sleep(4)
 
     if "/login" in (page.url or ""):
         browser.screenshot(page, "00-session-expired")
@@ -147,70 +148,62 @@ def do_checkin(page, github_cookies: list[dict]) -> str:
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    # ===== 3. 预操作：先直接点一次签到 =====
-    print("[checkin] 预操作：先直接点一次签到按钮（不等人机验证）")
-    if _click_checkin_action(page):
-        print("[checkin] 已发送第一次签到请求")
+    # ===== 3. 等验证码 widget 渲染 =====
+    print("[checkin] 等待验证码 widget 渲染（最多 60 秒）...")
+    captcha_info = browser.wait_captcha_widget(page, timeout=60)
+    print(f"[checkin] 检测到的验证码: {captcha_info}")
+    browser.screenshot(page, "03c-captcha-widget")
+
+    captcha_solved = False
+
+    if captcha_info.get("type") == "recaptcha":
+        # 4a. 优先用音频识别
+        print("[checkin] 尝试音频识别求解 reCAPTCHA...")
+        if browser.solve_recaptcha_via_audio(page, timeout=90):
+            print("[checkin] ✅ 音频识别成功")
+            captcha_solved = True
+        else:
+            print("[checkin] 音频识别失败，将回退 2captcha")
+    elif captcha_info.get("type") == "none":
+        print("[checkin] 未检测到验证码，直接尝试提交")
+        captcha_solved = True
     else:
-        print("[checkin] 第一次点击未找到按钮（忽略，继续刷新）")
-    time.sleep(3)
-    browser.screenshot(page, "03a-pre-click")
+        print(f"[checkin] 验证码类型 {captcha_info['type']} 需用 2captcha")
 
-    if _is_already_checked_in(page):
-        print("[checkin] 预操作后即签到成功")
-        time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
-        browser.screenshot(page, "05-success")
-        return "签到成功"
+    # 4b. 音频失败或无 API key → 用 2captcha
+    if not captcha_solved and captcha_info.get("type") != "none":
+        if not captcha_api_key:
+            browser.screenshot(page, "03d-no-apikey")
+            raise CaptchaTimeout(
+                f"{captcha_info['type']} 音频识别失败且未配置 CAPTCHA_API_KEY"
+            )
+        print(f"[checkin] 用 2captcha 解决 {captcha_info['type']}...")
+        token = browser.solve_captcha_via_2captcha(
+            page, captcha_api_key, captcha_info, timeout=240
+        )
+        if not token:
+            browser.screenshot(page, "03d-2captcha-fail")
+            raise CaptchaTimeout(f"2captcha 未能解决 {captcha_info['type']}")
+        browser.inject_captcha_token(page, token)
+        captcha_solved = True
+        time.sleep(2)
+        browser.screenshot(page, "03e-token-injected")
 
-    # ===== 4. 刷新页面 =====
-    print("[checkin] 刷新签到页")
-    page.refresh()
-    time.sleep(5)
-    browser.screenshot(page, "03b-after-refresh")
-
-    if "/login" in (page.url or ""):
-        raise LoginFailed(f"刷新后被踢回登录页（{page.url}）")
-
-    if _is_already_checked_in(page):
-        print("[checkin] 刷新后已显示已签到")
-        time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
-        browser.screenshot(page, "05-success")
-        return "本日已签到"
-
-    # ===== 5. 等 hCaptcha widget 渲染 =====
-    print("[checkin] 等待 hCaptcha widget 渲染（最多 30 秒）...")
-    widget_ok = browser.wait_hcaptcha_widget(page, timeout=30)
-    if widget_ok:
-        print("[checkin] hCaptcha widget 已渲染")
-    else:
-        print("[checkin] ⚠️ 30 秒内未检测到 hCaptcha widget")
-    browser.screenshot(page, "03c-hcaptcha-widget")
-
-    # ===== 6. NoneCap 解决 hCaptcha =====
-    if widget_ok:
-        print("[checkin] 等待 NoneCap 扩展解决 hCaptcha...")
-        if not browser.wait_hcaptcha_solved(page, timeout=180):
-            browser.screenshot(page, "03d-hcaptcha-timeout")
-            raise CaptchaTimeout("NoneCap 未能在 180 秒内解决 hCaptcha")
-        browser.screenshot(page, "03e-hcaptcha-solved")
-    else:
-        print("[checkin] 没有 widget，跳过 hCaptcha 等待（直接尝试提交）")
-
-    # ===== 7. 点击签到按钮 =====
+    # ===== 5. 点击签到按钮 =====
     print("[checkin] 点击签到按钮")
     if not _click_checkin_action(page):
         if _is_already_checked_in(page):
             print("[checkin] 未找到按钮但已显示签到状态")
             browser.screenshot(page, "05-success")
             return "本日已签到"
-        browser.screenshot(page, "03f-no-button")
+        browser.screenshot(page, "03g-no-button")
         raise CheckinElementsNotFound("未找到签到按钮")
 
     print("[checkin] 已点击签到按钮")
     time.sleep(3)
     browser.screenshot(page, "04-after-click")
 
-    # ===== 8. 确认签到成功 =====
+    # ===== 6. 确认签到成功 =====
     if not _confirm_checkin_success(page, timeout=30):
         print("[checkin] 第一次确认失败，等页面 reload 后再试...")
         time.sleep(5)
@@ -245,6 +238,12 @@ def main() -> int:
         print(f"[fatal] 加载 GitHub session 失败: {exc}")
         return 2
 
+    captcha_api_key = os.environ.get("CAPTCHA_API_KEY", "").strip()
+    if captcha_api_key:
+        print(f"[env] CAPTCHA_API_KEY: {captcha_api_key[:8]}...（已加载，作为兜底）")
+    else:
+        print("[env] 未配置 CAPTCHA_API_KEY，仅使用音频识别")
+
     browser.clean_screenshots()
     last_error: Exception | None = None
 
@@ -253,7 +252,7 @@ def main() -> int:
         page = None
         try:
             page = browser.create_page()
-            status = do_checkin(page, github_cookies)
+            status = do_checkin(page, github_cookies, captcha_api_key)
             state.mark_success()
             _send_result_snapshot(page, status, "06-result")
             print("[main] 任务完成")
