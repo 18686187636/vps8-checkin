@@ -49,22 +49,18 @@ jobs:
           mkdir -p extensions
           cd extensions
 
-          # 用 GitHub API 动态获取最新 Release 的资产下载链接
           echo "获取 NoneCap 最新 Release 信息..."
           RELEASE_JSON=$(curl -s "https://api.github.com/repos/nonecap/nonecap-extension/releases/latest")
 
-          # 提取第一个 zip 资产的下载 URL（浏览器兼容版本）
           DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           assets = data.get('assets', [])
-          # 优先匹配浏览器版本的 zip
           for a in assets:
               name = a['name'].lower()
               if name.endswith('.zip') and 'chrome' in name:
                   print(a['browser_download_url'])
                   sys.exit(0)
-          # 退而求其次：任何 zip
           for a in assets:
               if a['name'].endswith('.zip'):
                   print(a['browser_download_url'])
@@ -82,7 +78,6 @@ jobs:
 
           echo "下载地址: $DOWNLOAD_URL"
 
-          # 用多个镜像尝试下载
           download_ok=0
           for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
             echo "尝试: ${PREFIX}${DOWNLOAD_URL}"
@@ -116,7 +111,6 @@ jobs:
 
           echo "扩展目录: $MANIFEST_DIR"
 
-          # 生成 provision.json（如果有 NONE_CAP_KEY 则注入）
           if [ -n "${{ secrets.NONE_CAP_KEY }}" ]; then
             cat > "$MANIFEST_DIR/provision.json" <<EOF
           {
@@ -129,7 +123,6 @@ jobs:
           EOF
             echo "✅ 已生成 provision.json（含 API Key）"
           else
-            # 没有 API Key 时使用示例文件
             if [ -f "$MANIFEST_DIR/provision.example.json" ]; then
               cp "$MANIFEST_DIR/provision.example.json" "$MANIFEST_DIR/provision.json"
               echo "ℹ️ 使用 provision.example.json（免费额度：每天 100 次）"
@@ -141,33 +134,6 @@ jobs:
           echo "NONECAP_EXT_PATH=$(realpath "$MANIFEST_DIR")" >> "$GITHUB_ENV"
           echo "nonecap_ready=true" >> "$GITHUB_ENV"
           echo "✅ NoneCap 扩展准备完成"
-
-      # ===== 验证扩展是否加载成功 =====
-      - name: Verify extension loaded
-        if: env.nonecap_ready == 'true'
-        run: |
-          python3 <<'PY'
-          import os
-          from DrissionPage import ChromiumOptions, ChromiumPage
-          co = ChromiumOptions()
-          co.set_argument("--no-sandbox")
-          co.set_argument("--disable-dev-shm-usage")
-          co.set_argument("--disable-gpu")
-          co.set_argument("--enable-extensions")
-          co.set_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
-          co.add_extension(os.environ["NONECAP_EXT_PATH"])
-          page = ChromiumPage(co)
-          page.get("about:blank")
-          try:
-              exts = page.run_cdp("Browser.getExtensions")
-              print(f"已加载扩展数量: {len(exts)}")
-              for e in exts:
-                  print(f"  - {e.get('name', 'unknown')}")
-          except Exception as ex:
-              print(f"获取扩展列表失败: {ex}")
-          page.quit()
-          PY
-        continue-on-error: true
 
       - name: Configure sing-box proxy
         id: singbox
