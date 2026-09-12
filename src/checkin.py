@@ -1,12 +1,16 @@
-"""VPS8 (vps8.zz.cd) 签到主流程（GitHub OAuth 自动登录方案）。
+"""VPS8 (vps8.zz.cd) 签到主流程。
+
+登录：GitHub OAuth（注入 GitHub session → 静默登录 vps8）
+验证码：hCaptcha（由 NoneCap 扩展自动解决）
 
 环境变量：
     VPS8_GITHUB_SESSION_B64 (必填) Base64 编码的 GitHub session cookies
-    VPS8_PROXY              (可选) HTTP 代理地址
-    TELEGRAM_BOT_TOKEN      (可选)
-    TELEGRAM_CHAT_ID        (可选)
-    GITHUB_RUN_URL          (可选)
-    VPS8_USER_AGENT         (可选)
+    NONECAP_EXT_PATH       (必填) NoneCap 扩展目录路径
+    VPS8_PROXY             (可选) HTTP 代理地址
+    TELEGRAM_BOT_TOKEN     (可选)
+    TELEGRAM_CHAT_ID       (可选)
+    GITHUB_RUN_URL         (可选)
+    VPS8_USER_AGENT        (可选)
 
 退出码：
     0 - 签到成功，或本日已签到
@@ -47,7 +51,7 @@ class CheckinElementsNotFound(Exception):
     pass
 
 
-class TurnstileTimeout(Exception):
+class CaptchaTimeout(Exception):
     pass
 
 
@@ -76,6 +80,14 @@ def _click_checkin_action(page) -> bool:
       return s.display !== 'none' && s.visibility !== 'hidden'
         && r.width > 0 && r.height > 0 && !el.disabled;
     };
+    // 优先用精确 ID
+    const exact = document.querySelector('#points-signin-submit');
+    if (exact && isVisible(exact) && !exact.disabled) {
+      exact.scrollIntoView({block: 'center', inline: 'center'});
+      exact.click();
+      return true;
+    }
+    // 退路：按文案匹配
     const keywords = ['立即签到', '点击签到', '签到领取', '今日签到'];
     const candidates = Array.from(document.querySelectorAll(
       'button, [role="button"], input[type="button"], input[type="submit"]'
@@ -99,7 +111,7 @@ def _click_checkin_action(page) -> bool:
         return False
 
 
-def _confirm_checkin_success(page, timeout: int = 20) -> bool:
+def _confirm_checkin_success(page, timeout: int = 30) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _contains_any(_visible_page_text(page), CHECKED_TEXT_MARKERS):
@@ -109,12 +121,14 @@ def _confirm_checkin_success(page, timeout: int = 20) -> bool:
 
 
 def do_checkin(page, github_cookies: list[dict]) -> str:
+    # 1. GitHub OAuth 登录 vps8
     browser.inject_github_session(page, github_cookies)
     browser.login_via_github(page, timeout=90)
 
+    # 2. 进入签到页
     print(f"[checkin] 访问签到页: {CHECKIN_URL}")
     page.get(CHECKIN_URL)
-    time.sleep(2.5)
+    time.sleep(3)
 
     if "/login" in (page.url or ""):
         browser.screenshot(page, "00-session-expired")
@@ -123,13 +137,14 @@ def do_checkin(page, github_cookies: list[dict]) -> str:
     print(f"[checkin] 签到页 URL: {page.url}")
     browser.screenshot(page, "03-checkin-page")
 
+    # 3. 检查是否已经签到
     time.sleep(2)
     page_text = _visible_page_text(page)
 
     if "今日签到状态" in page_text and (
         "已签到" in page_text and "未签到" not in page_text
     ):
-        print("[checkin] 今日已签到")
+        print("[checkin] 今日已签到（服务端确认）")
         time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
         browser.screenshot(page, "05-success")
         return "本日已签到"
@@ -142,29 +157,34 @@ def do_checkin(page, github_cookies: list[dict]) -> str:
         browser.screenshot(page, "05-success")
         return "本日已签到"
 
-    print("[checkin] 处理 Cloudflare Turnstile")
-    if not browser.solve_turnstile(page, timeout=60):
-        browser.screenshot(page, "03c-turnstile-fail")
-        raise TurnstileTimeout("Turnstile 未通过")
+    # 4. 等待 NoneCap 扩展解决 hCaptcha
+    print("[checkin] 等待 NoneCap 扩展解决 hCaptcha...")
+    if not browser.wait_hcaptcha_solved(page, timeout=180):
+        browser.screenshot(page, "03c-hcaptcha-timeout")
+        raise CaptchaTimeout("hCaptcha 未在 180s 内解决（NoneCap 可能未加载或额度用完）")
 
-    time.sleep(1.5)
-    browser.screenshot(page, "03d-after-turnstile")
-
+    # 5. hCaptcha 已通过，点击签到按钮
+    print("[checkin] hCaptcha 已通过，点击签到按钮")
     if not _click_checkin_action(page):
         if _contains_any(_visible_page_text(page), CHECKED_TEXT_MARKERS):
-            print("[checkin] 未找到按钮但已签到")
+            print("[checkin] 未找到按钮但已显示签到状态")
             browser.screenshot(page, "05-success")
             return "本日已签到"
         browser.screenshot(page, "03b-no-button")
         raise CheckinElementsNotFound("未找到签到按钮")
 
     print("[checkin] 已点击签到按钮")
-    time.sleep(2)
+    time.sleep(3)
     browser.screenshot(page, "04-after-click")
 
+    # 6. 确认签到成功
     if not _confirm_checkin_success(page, timeout=30):
-        browser.screenshot(page, "04b-not-confirmed")
-        raise CheckinNotConfirmed("未确认签到成功")
+        # 有些情况下签到后页面会 reload
+        print("[checkin] 第一次确认失败，等待页面 reload 后再试...")
+        time.sleep(5)
+        if not _confirm_checkin_success(page, timeout=15):
+            browser.screenshot(page, "04b-not-confirmed")
+            raise CheckinNotConfirmed("点击签到后未确认到签到成功状态")
 
     time.sleep(SUCCESS_SNAPSHOT_DELAY_SECONDS)
     browser.screenshot(page, "05-success")
