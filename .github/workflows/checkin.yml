@@ -2,7 +2,6 @@ name: VPS8 Checkin
 
 on:
   schedule:
-    # 每 8 小时一次（北京时间 9:23 / 17:23 / 1:23）
     - cron: "23 1,9,17 * * *"
   workflow_dispatch:
 
@@ -18,17 +17,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Debug - source check
-        run: |
-          echo "===== src/ 目录 ====="
-          ls -la src/ || echo "src/ 不存在"
-          echo ""
-          echo "===== checkin.py 调用 create_page / apply_cookies 的地方 ====="
-          grep -n "create_page\|apply_cookies" src/checkin.py || echo "无匹配"
-          echo ""
-          echo "===== browser.py 关键函数签名 ====="
-          grep -n "def create_page\|def apply_cookies\|def _inject_cookies" src/browser.py || echo "无匹配"
 
       - name: Compute Beijing date
         id: bjdate
@@ -55,63 +43,6 @@ jobs:
 
       - name: Install Xvfb
         run: sudo apt-get install -y xvfb
-
-      - name: Debug - cookie probe
-        env:
-          VPS8_STORAGE_STATE_B64: ${{ secrets.VPS8_STORAGE_STATE_B64 }}
-        run: |
-          python3 - <<'PY'
-          import base64, json, os
-          raw = os.environ.get("VPS8_STORAGE_STATE_B64", "")
-          print(f"VPS8_STORAGE_STATE_B64 长度: {len(raw)}")
-          cookies = json.loads(base64.b64decode(raw).decode())
-          if isinstance(cookies, dict):
-              cookies = cookies.get("cookies", [])
-          php = next((c for c in cookies if c["name"] == "PHPSESSID"), None)
-          if not php:
-              print("::error::找不到 PHPSESSID")
-              raise SystemExit(1)
-          open("/tmp/php.txt", "w").write(php["value"])
-          print(f"PHPSESSID = {php['value']}")
-          PY
-
-          PHP=$(cat /tmp/php.txt)
-          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-
-          echo ""
-          echo "===== [1] 首次 /dashboard（带 PHPSESSID，触发反爬）====="
-          curl -s -i -c /tmp/jar.txt -o /tmp/r1.txt \
-            -H "Cookie: PHPSESSID=$PHP" \
-            -H "User-Agent: $UA" \
-            "https://vps8.zz.cd/dashboard"
-          echo "状态行: $(head -1 /tmp/r1.txt)"
-          echo "set-cookie:"
-          grep -i "^set-cookie" /tmp/r1.txt || echo "  (无)"
-
-          echo ""
-          echo "===== [2] 第二次 /dashboard（带 jar，通过反爬）====="
-          curl -s -i -b /tmp/jar.txt -c /tmp/jar.txt -o /tmp/r2.txt \
-            -H "User-Agent: $UA" \
-            "https://vps8.zz.cd/dashboard"
-          echo "状态行: $(head -1 /tmp/r2.txt)"
-          echo "title: $(grep -o '<title>[^<]*</title>' /tmp/r2.txt | head -1)"
-
-          echo ""
-          echo "===== [3] 直接请求 /points/signin（带 jar，跳过首页）====="
-          curl -s -i -b /tmp/jar.txt -c /tmp/jar.txt -o /tmp/r3.txt \
-            -H "User-Agent: $UA" \
-            "https://vps8.zz.cd/points/signin"
-          echo "状态行: $(head -1 /tmp/r3.txt)"
-          echo "location: $(grep -i '^location' /tmp/r3.txt || echo '(无)')"
-          echo "title: $(grep -o '<title>[^<]*</title>' /tmp/r3.txt | head -1)"
-
-          echo ""
-          echo "===== 结论 ====="
-          if grep -qi '^location.*login' /tmp/r3.txt; then
-            echo "::warning::/points/signin 仍跳 login（session 真的失效）"
-          else
-            echo "session 有效，签到页可访问"
-          fi
 
       - name: Run checkin
         env:
