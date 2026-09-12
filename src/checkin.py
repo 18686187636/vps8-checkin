@@ -109,11 +109,9 @@ def _confirm_checkin_success(page, timeout: int = 20) -> bool:
 
 
 def do_checkin(page, github_cookies: list[dict]) -> str:
-    # 注入 GitHub session，走 OAuth 登录 vps8
     browser.inject_github_session(page, github_cookies)
     browser.login_via_github(page, timeout=90)
 
-    # 现在应该已经在 vps8 里，直接去签到页
     print(f"[checkin] 访问签到页: {CHECKIN_URL}")
     page.get(CHECKIN_URL)
     time.sleep(2.5)
