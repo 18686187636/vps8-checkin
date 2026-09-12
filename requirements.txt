@@ -1,2 +1,4 @@
 DrissionPage>=4.1.0.18
 requests>=2.31.0
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
