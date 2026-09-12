@@ -1,0 +1,213 @@
+name: Setup GitHub Session
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        run: |
+          pip install -r requirements.txt
+          pip install pynacl requests
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb x11vnc novnc websockify \
+            chromium-browser || sudo apt-get install -y \
+            xvfb x11vnc novnc websockify chromium
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Configure sing-box proxy
+        id: singbox
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          SING_BOX_VERSION: "1.10.7"
+        run: |
+          set -e
+          if [ -z "$NODE_LINK" ]; then
+            echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理"
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64)  SB_ARCH="amd64" ;;
+            aarch64|arm64) SB_ARCH="arm64" ;;
+            *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
+          esac
+
+          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
+
+          download_ok=0
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
+                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
+              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
+                download_ok=1
+                break
+              else
+                rm -f sing-box.tar.gz
+              fi
+            fi
+          done
+
+          if [ "$download_ok" != "1" ]; then
+            echo "❌ sing-box 下载失败"
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tar -xzf sing-box.tar.gz
+          SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
+          sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
+          sudo chmod +x /usr/local/bin/sing-box
+          rm -rf sing-box.tar.gz "$SING_BOX_DIR"
+
+          python3 << 'PYEOF'
+          import json, sys, os, re
+          from urllib.parse import urlparse, parse_qs
+          link = os.environ.get('NODE_LINK', '')
+          parsed = urlparse(link)
+          netloc = parsed.netloc
+          uuid, host_port = netloc.split('@', 1) if '@' in netloc else ('', netloc)
+          host, port = '', '443'
+          bm = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if bm:
+              host = bm.group(1)
+              if bm.group(2): port = bm.group(2)
+          else:
+              if host_port.count(':') > 1: host = host_port
+              elif ':' in host_port: host, port = host_port.split(':', 1)
+              else: host = host_port
+          params = parse_qs(parsed.query)
+          sni = params.get('sni', [''])[0] or host
+          fp = params.get('fp', [''])[0] or 'chrome'
+          flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
+          type_ = params.get('type', ['tcp'])[0]
+          security = params.get('security', [''])[0]
+          path = params.get('path', [''])[0]
+          host_header = params.get('host', [''])[0] or host
+          outbound = {"type": "vless", "tag": "vless-out", "server": host,
+                      "server_port": int(port), "uuid": uuid, "flow": flow,
+                      "packet_encoding": "packetaddr"}
+          if security.lower() != 'none':
+              outbound["tls"] = {"enabled": True, "server_name": sni, "insecure": False,
+                                 "utls": {"enabled": True, "fingerprint": fp}}
+          if type_ != 'tcp':
+              transport = {"type": type_}
+              if type_ == 'ws':
+                  transport["path"] = path or "/"
+                  transport["headers"] = {"Host": host_header}
+              elif type_ == 'grpc':
+                  transport["service_name"] = path or ""
+              outbound["transport"] = transport
+          if security == 'reality':
+              outbound['tls']['reality'] = {"enabled": True,
+                                            "public_key": params.get('pbk', [''])[0],
+                                            "short_id": params.get('sid', [''])[0]}
+          config = {"log": {"level": "warn"},
+                    "inbounds": [
+                        {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                        {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}],
+                    "outbounds": [outbound],
+                    "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}}
+          with open("sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          PYEOF
+
+          nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
+          sleep 5
+          if ss -tuln 2>/dev/null | grep -q ':1080' || netstat -tuln 2>/dev/null | grep -q ':1080'; then
+            echo "✅ 代理已启动"
+            echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ 代理启动失败"
+            cat sing-box.log
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+          sleep 3
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Start x11vnc
+        run: |
+          x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg > /tmp/x11vnc.log 2>&1
+          sleep 3
+
+      - name: Start noVNC
+        run: |
+          sudo websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+          sleep 3
+          curl -s http://localhost:6080/ > /dev/null && echo "noVNC 就绪"
+
+      - name: Start cloudflared tunnel
+        run: |
+          cloudflared tunnel --url http://localhost:6080 > /tmp/cloudflared.log 2>&1 &
+          sleep 20
+          grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 > /tmp/tunnel_url.txt
+          URL=$(cat /tmp/tunnel_url.txt)
+          if [ -z "$URL" ]; then
+            echo "❌ 未获取到 tunnel URL"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+          echo "Tunnel URL: $URL"
+          {
+            echo "## noVNC 地址";
+            echo "";
+            echo "### [$URL]($URL)";
+            echo "";
+            echo "**在 noVNC 里：**";
+            echo "1. 点页面上的 **GitHub** 按钮";
+            echo "2. 输入 GitHub 账号密码";
+            echo "3. 完成 2FA";
+            echo "4. 如果有 Authorize 页面，点 **Authorize**";
+            echo "5. 等待跳回 vps8 的 dashboard";
+            echo "";
+            echo "**进入 dashboard 后**，脚本会自动导出 session 并更新 Secret（约 30 秒）。";
+            echo "看到 workflow 结束就算成功。";
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start Chrome and wait for login
+        env:
+          VPS8_PROXY: ${{ steps.singbox.outputs.proxy_ready == 'true' && 'http://127.0.0.1:1081' || '' }}
+          GH_PAT: ${{ secrets.VPS8_GH_PAT }}
+        run: |
+          python tools/setup_github_session.py 2>&1 | tee /tmp/setup.log
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f "cloudflared" || true
+          pkill -f "websockify" || true
+          pkill -f "x11vnc" || true
+          pkill -f "Xvfb" || true
+          if [ -f sing-box.log ]; then
+            echo "===== sing-box.log ====="
+            tail -30 sing-box.log
+          fi
