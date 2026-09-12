@@ -1,8 +1,8 @@
-"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + reCAPTCHA 音频识别 + 截图。
+"""DrissionPage 浏览器封装：反检测启动 + GitHub OAuth 登录 + 通用验证码 + 截图。
 
 验证码方案：
-1. 优先用音频挑战 + Google Speech 识别（免费）
-2. 失败回退 2captcha API（如果配置了 CAPTCHA_API_KEY）
+1. reCAPTCHA 优先音频识别（免费）
+2. 失败回退 2captcha
 """
 
 from __future__ import annotations
@@ -325,17 +325,10 @@ def _try_click_github_login(page: ChromiumPage) -> bool:
     return False
 
 
-def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
-    print("[browser] 先检查 vps8 登录态...")
-    if is_logged_in(page):
-        print("[browser] ✅ 已经登录 vps8，无需 OAuth")
-        return
-
-    print("[browser] 未登录，走 GitHub OAuth 流程")
-
+def _do_one_oauth_round(page: ChromiumPage, timeout: int) -> bool:
+    """执行一轮 GitHub OAuth。返回是否成功。"""
     if not _try_click_github_login(page):
-        screenshot(page, "10-no-github-button")
-        raise RuntimeError("找不到 GitHub 登录按钮")
+        return False
 
     print("[browser] 已点击 GitHub 登录，等待跳转...")
 
@@ -343,10 +336,6 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
     last_url = ""
     authorize_clicked_for_url = ""
     authorize_clicked_at = 0.0
-    stuck_at_authorize_since = 0.0
-    stuck_at_login_since = 0.0
-    retry_count = 0
-    MAX_RETRIES = 3
 
     while time.time() < deadline:
         try:
@@ -356,127 +345,137 @@ def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
         if url and url != last_url:
             print(f"[browser] URL: {url}")
             last_url = url
-            stuck_at_authorize_since = 0.0
 
         if "access_denied" in url:
-            screenshot(page, "10-access-denied")
-            raise RuntimeError(f"GitHub 拒绝授权: {url}")
+            print(f"[browser] ⚠️ access_denied: {url[:120]}")
+            return False
 
         if "vps8.zz.cd" in url and "/login" not in url and "/github" not in url:
             print(f"[browser] OAuth 完成，当前 URL: {url}")
             time.sleep(2.5)
-            return
+            return True
 
-        if "github.com" in url and "/oauth/authorize" in url:
-            if "client_id=" in url:
-                if authorize_clicked_for_url != url:
-                    time.sleep(3)
-                    clicked = False
+        if "github.com" in url and "/oauth/authorize" in url and "client_id=" in url:
+            if authorize_clicked_for_url != url:
+                time.sleep(3)
+                clicked = False
+                try:
+                    if page.run_js(AUTHORIZE_BTN_JS):
+                        clicked = True
+                except Exception as exc:
+                    print(f"[browser] 点击 Authorize 异常: {exc}")
+                if not clicked:
                     try:
-                        if page.run_js(AUTHORIZE_BTN_JS):
+                        ele = page.ele("xpath://button[@name='authorize']", timeout=3)
+                        if ele:
+                            ele.click()
                             clicked = True
                     except Exception as exc:
-                        print(f"[browser] 点击 Authorize 异常: {exc}")
-                    if not clicked:
-                        try:
-                            ele = page.ele("xpath://button[@name='authorize']", timeout=3)
-                            if ele:
-                                ele.click()
-                                clicked = True
-                        except Exception as exc:
-                            print(f"[browser] ele 点击 Authorize 异常: {exc}")
-                    if clicked:
-                        print("[browser] 已点击 GitHub Authorize")
-                        authorize_clicked_for_url = url
-                        authorize_clicked_at = time.time()
-                        time.sleep(4)
-                        continue
-                    else:
-                        print("[browser] 本轮未点到 Authorize，3 秒后重试")
-                        time.sleep(3)
+                        print(f"[browser] ele 点击 Authorize 异常: {exc}")
+                if clicked:
+                    print("[browser] 已点击 GitHub Authorize")
+                    authorize_clicked_for_url = url
+                    authorize_clicked_at = time.time()
+                    time.sleep(4)
                 else:
-                    elapsed = time.time() - authorize_clicked_at
-                    if elapsed > 20:
-                        retry_count += 1
-                        print(f"[browser] 授权页卡住 {elapsed:.0f}s，重试整个流程（第 {retry_count} 次）")
-                        if retry_count >= MAX_RETRIES:
-                            screenshot(page, "10-authorize-stuck")
-                            raise RuntimeError(f"授权页反复卡住，URL: {url}")
-                        if not _try_click_github_login(page):
-                            raise RuntimeError("重试时找不到 GitHub 按钮")
-                        authorize_clicked_for_url = ""
-                        stuck_at_authorize_since = 0.0
-                        continue
-                    time.sleep(1)
-                continue
+                    print("[browser] 本轮未点到 Authorize，3 秒后重试")
+                    time.sleep(3)
             else:
-                if stuck_at_authorize_since == 0:
-                    stuck_at_authorize_since = time.time()
-                    print(f"[browser] 授权页无参数（{url}），等待自动跳转")
-                elif time.time() - stuck_at_authorize_since > 30:
-                    retry_count += 1
-                    print(f"[browser] 无参数页等待超 30s，重试整个流程（第 {retry_count} 次）")
-                    if retry_count >= MAX_RETRIES:
-                        screenshot(page, "10-authorize-stuck")
-                        raise RuntimeError(f"无参数授权页反复卡住，URL: {url}")
-                    if not _try_click_github_login(page):
-                        raise RuntimeError("重试时找不到 GitHub 按钮")
-                    authorize_clicked_for_url = ""
-                    stuck_at_authorize_since = 0.0
-                    continue
+                elapsed = time.time() - authorize_clicked_at
+                if elapsed > 25:
+                    print(f"[browser] 授权页卡住 {elapsed:.0f}s，本轮结束")
+                    return False
                 time.sleep(1)
-                continue
-
-        if "vps8.zz.cd" in url and "/login" in url:
-            if stuck_at_login_since == 0:
-                stuck_at_login_since = time.time()
-            elif time.time() - stuck_at_login_since > 15:
-                retry_count += 1
-                print(f"[browser] 卡在 vps8 登录页超 15s，重试（第 {retry_count} 次）")
-                if retry_count >= MAX_RETRIES:
-                    raise RuntimeError("反复卡在 vps8 登录页")
-                if not _try_click_github_login(page):
-                    raise RuntimeError("重试时找不到 GitHub 按钮")
-                authorize_clicked_for_url = ""
-                stuck_at_login_since = 0.0
-                continue
-        else:
-            stuck_at_login_since = 0.0
+            continue
 
         time.sleep(1)
 
+    return False
+
+
+def login_via_github(page: ChromiumPage, timeout: int = 120) -> None:
+    print("[browser] 先检查 vps8 登录态...")
+    if is_logged_in(page):
+        print("[browser] ✅ 已经登录 vps8，无需 OAuth")
+        return
+
+    print("[browser] 未登录，走 GitHub OAuth 流程")
+
+    max_oauth_rounds = 3
+    for round_no in range(1, max_oauth_rounds + 1):
+        print(f"\n[browser] === OAuth 第 {round_no}/{max_oauth_rounds} 轮 ===")
+        ok = _do_one_oauth_round(page, timeout=timeout)
+        if ok:
+            return
+
+        if round_no < max_oauth_rounds:
+            delay = 30 + round_no * 15
+            print(f"[browser] OAuth 未完成，等 {delay} 秒后重试...")
+            time.sleep(delay)
+
     screenshot(page, "10-oauth-timeout")
-    raise RuntimeError(f"GitHub OAuth 超时，当前 URL: {page.url}")
+    raise RuntimeError(f"GitHub OAuth {max_oauth_rounds} 轮均失败，当前 URL: {page.url}")
 
 
 # ---------------------------------------------------------------------------
-# 验证码检测
+# 验证码检测（更宽松）
 # ---------------------------------------------------------------------------
 
 CAPTCHA_DETECT_JS = r"""
 (() => {
-  if (document.querySelector('.g-recaptcha, iframe[src*="recaptcha"]')) {
-    const el = document.querySelector('.g-recaptcha');
+  // 1. Google reCAPTCHA - 多种检测方式
+  const grecaptchaEls = document.querySelectorAll('.g-recaptcha');
+  if (grecaptchaEls.length > 0) {
+    const el = grecaptchaEls[0];
     return JSON.stringify({
       type: 'recaptcha',
-      sitekey: el ? (el.getAttribute('data-sitekey') || '') : '',
+      sitekey: el.getAttribute('data-sitekey') || '',
+      source: 'g-recaptcha-div',
     });
   }
+  const recaptchaIframe = document.querySelector(
+    'iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"], iframe[title*="recaptcha"]'
+  );
+  if (recaptchaIframe) {
+    return JSON.stringify({
+      type: 'recaptcha',
+      sitekey: '',
+      source: 'recaptcha-iframe',
+    });
+  }
+  const anySitekey = document.querySelector('[data-sitekey]');
+  if (anySitekey) {
+    const sk = anySitekey.getAttribute('data-sitekey') || '';
+    // 判断 sitekey 属于哪个服务
+    const cls = (anySitekey.className || '').toLowerCase();
+    if (cls.includes('h-captcha') || sk.startsWith('1')) {
+      return JSON.stringify({type: 'hcaptcha', sitekey: sk, source: 'data-sitekey'});
+    }
+    if (cls.includes('cf-turnstile') || sk.startsWith('0x')) {
+      return JSON.stringify({type: 'turnstile', sitekey: sk, source: 'data-sitekey'});
+    }
+    // 默认当作 reCAPTCHA
+    return JSON.stringify({type: 'recaptcha', sitekey: sk, source: 'data-sitekey'});
+  }
+  // 2. hCaptcha
   if (document.querySelector('.h-captcha, iframe[src*="hcaptcha"]')) {
     const el = document.querySelector('.h-captcha');
     return JSON.stringify({
       type: 'hcaptcha',
       sitekey: el ? (el.getAttribute('data-sitekey') || '') : '',
+      source: 'h-captcha',
     });
   }
+  // 3. Turnstile
   if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]')) {
     const el = document.querySelector('.cf-turnstile, [data-sitekey]');
     return JSON.stringify({
       type: 'turnstile',
       sitekey: el ? (el.getAttribute('data-sitekey') || '') : '',
+      source: 'cf-turnstile',
     });
   }
-  return JSON.stringify({type: 'none', sitekey: ''});
+  return JSON.stringify({type: 'none', sitekey: '', source: 'not-found'});
 })()
 """
 
@@ -500,7 +499,7 @@ def detect_captcha(page: ChromiumPage) -> dict:
             return json.loads(raw) if isinstance(raw, str) else raw
     except Exception as exc:
         print(f"[captcha] 检测失败: {exc}")
-    return {"type": "none", "sitekey": ""}
+    return {"type": "none", "sitekey": "", "source": "error"}
 
 
 def get_captcha_token(page: ChromiumPage) -> str:
@@ -511,18 +510,48 @@ def get_captcha_token(page: ChromiumPage) -> str:
         return ""
 
 
-def wait_captcha_widget(page: ChromiumPage, timeout: int = 60) -> dict:
+def wait_captcha_widget(page: ChromiumPage, timeout: int = 120) -> dict:
+    """等待 widget 渲染，每 10 秒 dump 一次页面状态方便排查。"""
     deadline = time.time() + timeout
+    last_report = 0
+
     while time.time() < deadline:
         info = detect_captcha(page)
         if info.get("type") != "none":
+            print(f"[captcha] ✅ 检测到 {info['type']}（source={info.get('source')}, sitekey={info.get('sitekey', '')[:16]}）")
             return info
+
+        now = time.time()
+        if now - last_report >= 10:
+            remaining = int(deadline - now)
+            try:
+                page_text_len = page.run_js("return (document.body && document.body.innerText || '').length;")
+            except Exception:
+                page_text_len = 0
+            try:
+                div_count = page.run_js("return document.querySelectorAll('div, iframe, form').length;")
+            except Exception:
+                div_count = 0
+            try:
+                has_recaptcha_script = page.run_js(
+                    "return Array.from(document.querySelectorAll('script')).some(s => (s.src||'').includes('recaptcha'));"
+                )
+            except Exception:
+                has_recaptcha_script = False
+            print(
+                f"[captcha] 等待 widget 渲染中... 剩余 {remaining}s "
+                f"(bodyTextLen={page_text_len}, elements={div_count}, hasRecaptchaScript={has_recaptcha_script})"
+            )
+            last_report = now
+
         time.sleep(2)
-    return {"type": "none", "sitekey": ""}
+
+    print(f"[captcha] ⚠️ {timeout}s 内未检测到 widget")
+    return {"type": "none", "sitekey": "", "source": "timeout"}
 
 
 # ---------------------------------------------------------------------------
-# reCAPTCHA 音频挑战求解
+# reCAPTCHA 音频识别
 # ---------------------------------------------------------------------------
 
 def _find_recaptcha_frame(page: ChromiumPage, keyword: str):
@@ -540,7 +569,6 @@ def _find_recaptcha_frame(page: ChromiumPage, keyword: str):
 
 
 def _is_recaptcha_solved(page: ChromiumPage) -> bool:
-    # 方法 1：查 token
     try:
         for frame in page.get_frames():
             try:
@@ -563,7 +591,6 @@ def _is_recaptcha_solved(page: ChromiumPage) -> bool:
     except Exception:
         pass
 
-    # 方法 2：检查主页面上的 g-recaptcha-response
     try:
         token = get_captcha_token(page)
         if token and len(token) > 30:
@@ -571,7 +598,6 @@ def _is_recaptcha_solved(page: ChromiumPage) -> bool:
     except Exception:
         pass
 
-    # 方法 3：查 anchor 的 aria-checked
     anchor = _find_recaptcha_frame(page, "anchor")
     if anchor:
         try:
@@ -591,7 +617,6 @@ def _is_recaptcha_solved(page: ChromiumPage) -> bool:
 
 
 def _click_recaptcha_checkbox(page: ChromiumPage) -> bool:
-    # 等 anchor iframe
     for _ in range(60):
         anchor = _find_recaptcha_frame(page, "anchor")
         if anchor:
@@ -626,7 +651,6 @@ def _switch_to_audio(page: ChromiumPage) -> bool:
     if not bframe:
         return False
 
-    # 已经在音频模式？
     try:
         input_box = bframe.ele("#audio-response", timeout=1)
         if input_box and input_box.states.is_displayed:
@@ -649,7 +673,6 @@ def _switch_to_audio(page: ChromiumPage) -> bool:
         except Exception:
             pass
 
-    # JS 兜底
     try:
         bframe.run_js(r"""
             (() => {
@@ -711,7 +734,7 @@ def _download_recaptcha_audio(url: str) -> Optional[str]:
                 f.write(r.content)
             return path
         except Exception as exc:
-            print(f"[recaptcha] 下载 {u[:60]} 失败: {exc}")
+            print(f"[recaptcha] 下载失败: {exc}")
             continue
     return None
 
@@ -774,8 +797,7 @@ def _fill_recaptcha_audio(page: ChromiumPage, text: str) -> bool:
     return True
 
 
-def solve_recaptcha_via_audio(page: ChromiumPage, timeout: int = 90) -> bool:
-    """用音频挑战解决 Google reCAPTCHA v2。"""
+def solve_recaptcha_via_audio(page: ChromiumPage, timeout: int = 120) -> bool:
     print("[recaptcha] 开始音频挑战求解...")
     start = time.time()
 
@@ -849,7 +871,7 @@ def solve_recaptcha_via_audio(page: ChromiumPage, timeout: int = 90) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 2captcha 兜底（支持 recaptcha / hcaptcha / turnstile）
+# 2captcha 兜底
 # ---------------------------------------------------------------------------
 
 def solve_captcha_via_2captcha(
@@ -867,7 +889,7 @@ def solve_captcha_via_2captcha(
 
     existing = get_captcha_token(page)
     if existing:
-        print(f"[2captcha] 页面已有 token（{len(existing)} 字符），无需调用 API")
+        print(f"[2captcha] 页面已有 token（{len(existing)} 字符）")
         return existing
 
     page_url = page.url
