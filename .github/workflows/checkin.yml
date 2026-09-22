@@ -31,16 +31,23 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Install Chrome
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
+          sudo apt-get install -y xvfb ffmpeg
 
-      - name: Install Xvfb
-        run: sudo apt-get install -y xvfb
+      - name: Setup Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
 
-      - name: Install ffmpeg (reCAPTCHA 音频识别需要)
-        run: sudo apt-get install -y ffmpeg
+      - name: Symlink chromium and chromedriver
+        run: |
+          sudo ln -sf "${{ steps.setup-chrome.outputs.chrome-path }}" /usr/local/bin/chromium
+          sudo ln -sf "${{ steps.setup-chrome.outputs.chrome-path }}" /usr/local/bin/chromium-browser
+          sudo ln -sf "${{ steps.setup-chrome.outputs.chromedriver-path }}" /usr/local/bin/chromedriver
 
       - name: Configure sing-box proxy
         id: singbox
@@ -143,6 +150,8 @@ jobs:
           CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           VPS8_PROXY: ${{ steps.singbox.outputs.proxy_ready == 'true' && 'http://127.0.0.1:1081' || '' }}
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: xvfb-run -a python -m src.checkin
 
       - name: Show sing-box log on failure
